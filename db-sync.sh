@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 #
-# db-sync.sh — Pull the live database down to your local environment.
+# db-sync.sh — Sync the database between the live server and your local environment.
+#
+# Pulls live → local by default; pass --push to send local → live.
 #
 # Requirements:
 #   - SSH access to the production server (Laravel Forge / Cloud).
@@ -11,6 +13,7 @@
 #   bash scripts/db-sync.sh forge@bandpage.com
 #   bash scripts/db-sync.sh forge@bandpage.com bandpage
 #   bash scripts/db-sync.sh --ssh-host=bandpage.com --ssh-user=forge
+#   bash scripts/db-sync.sh forge@bandpage.com --push
 #
 set -euo pipefail
 
@@ -33,6 +36,10 @@ usage() {
     echo "  --ssh-user=USER       SSH username (e.g. forge)"
     echo "  --db-name=NAME        Remote database name"
     echo ""
+    echo "Direction:"
+    echo "  --pull, --from-live   Copy the live database to local (default)"
+    echo "  --push, --to-live     Copy the local database to live (DESTRUCTIVE)"
+    echo ""
     echo "Optional:"
     echo "  --db-user=USER        Remote DB username (overrides remote .env)"
     echo "  --db-pass=PASS        Remote DB password (overrides remote .env)"
@@ -42,7 +49,8 @@ usage() {
     echo "  --remote-env=PATH     Path to .env on the server (default: ~/HOST/.env)"
     echo "  --ssh-port=PORT       SSH port (default: 22)"
     echo "  --ssh-key=PATH        Path to SSH private key (default: SSH agent)"
-    echo "  -y, --yes             Skip the confirmation prompt"
+    echo "  -y, --yes             Skip the confirmation prompt (pull only)"
+    echo "  --force-push          Skip the confirmation prompt when pushing to live"
     echo "  -h, --help            Show this help message"
     echo ""
 }
@@ -60,9 +68,14 @@ PROD_DB_USERNAME=""
 PROD_DB_PASSWORD=""
 REMOTE_ENV_PATH=""
 ASSUME_YES=""
+FORCE_PUSH=""
+DIRECTION="pull"
 
 for arg in "$@"; do
     case "$arg" in
+        --push|--to-live)   DIRECTION="push" ;;
+        --pull|--from-live) DIRECTION="pull" ;;
+        --force-push)       FORCE_PUSH="1" ;;
         --ssh-host=*)  PROD_SSH_HOST="${arg#*=}" ;;
         --ssh-user=*)  PROD_SSH_USER="${arg#*=}" ;;
         --ssh-port=*)  PROD_SSH_PORT="${arg#*=}" ;;
@@ -92,13 +105,6 @@ for arg in "$@"; do
     esac
 done
 
-# Default db-user to the SSH user
-PROD_DB_USERNAME="${PROD_DB_USERNAME:-$PROD_SSH_USER}"
-
-# Default db name to the lowercased project folder name
-DEFAULT_DB_NAME="$(basename "$PROJECT_ROOT" | tr '[:upper:]' '[:lower:]')"
-PROD_DB_DATABASE="${PROD_DB_DATABASE:-$DEFAULT_DB_NAME}"
-
 if [[ -z "$PROD_SSH_HOST" || -z "$PROD_SSH_USER" ]]; then
     echo "Error: SSH host and SSH user are required."
     usage
@@ -115,11 +121,7 @@ fi
 
 # ── Read remote .env ─────────────────────────────────────────────────────────
 
-# Default Forge path: ~/HOST/.env (e.g. /home/forge/bandpage.com/.env)
-REMOTE_ENV_PATH="${REMOTE_ENV_PATH:-~/$PROD_SSH_HOST/.env}"
-
 echo ""
-echo "  Reading remote .env from $PROD_SSH_USER@$PROD_SSH_HOST:$REMOTE_ENV_PATH..."
 
 remote_env_value() {
     local key="$1" content="$2"
@@ -132,10 +134,31 @@ remote_env_value() {
               -e 's/^"//' -e 's/"$//'
 }
 
-REMOTE_ENV_CONTENT="$(ssh "${SSH_OPTS[@]}" "$PROD_SSH_USER@$PROD_SSH_HOST" "cat $REMOTE_ENV_PATH" 2>/dev/null || true)"
+if [[ -n "$REMOTE_ENV_PATH" ]]; then
+    echo "  Reading remote .env from $PROD_SSH_USER@$PROD_SSH_HOST:$REMOTE_ENV_PATH..."
+    REMOTE_ENV_LOOKUP="cat $REMOTE_ENV_PATH"
+else
+    # The Forge convention is ~/SITE/.env, but SITE is the site's directory name,
+    # which only matches the SSH host when you connect by domain. Connecting by IP
+    # (or to a *.on-forge.com site) needs the single ~/*/.env in the home directory.
+    echo "  Looking for the remote .env on $PROD_SSH_USER@$PROD_SSH_HOST..."
+    REMOTE_ENV_LOOKUP="for f in ~/$PROD_SSH_HOST/.env ~/*/.env; do
+        if [ -f \"\$f\" ]; then echo \"# db-sync-env: \$f\"; cat \"\$f\"; exit 0; fi
+    done"
+fi
+
+# -n keeps ssh from swallowing stdin, which the confirmation prompt still needs.
+REMOTE_ENV_CONTENT="$(ssh -n "${SSH_OPTS[@]}" "$PROD_SSH_USER@$PROD_SSH_HOST" "$REMOTE_ENV_LOOKUP" 2>/dev/null || true)"
+
+# The lookup marks which file it found, so the run is auditable.
+REMOTE_ENV_FOUND="$(echo "$REMOTE_ENV_CONTENT" | grep -E '^# db-sync-env: ' | head -1 | cut -d' ' -f3-)"
+if [[ -n "$REMOTE_ENV_FOUND" ]]; then
+    REMOTE_ENV_PATH="$REMOTE_ENV_FOUND"
+    echo "  Found $REMOTE_ENV_PATH"
+fi
 
 if [[ -z "$REMOTE_ENV_CONTENT" ]]; then
-    echo "  Warning: Could not read remote .env at $REMOTE_ENV_PATH. Falling back to flag values."
+    echo "  Warning: Could not read a remote .env. Falling back to flag values."
 else
     # Use remote .env values as defaults (flags take precedence)
     [[ -z "$PROD_DB_DATABASE" ]] && PROD_DB_DATABASE="$(remote_env_value DB_DATABASE "$REMOTE_ENV_CONTENT")"
@@ -145,9 +168,11 @@ else
     [[ -z "$PROD_DB_PORT" ]]     && PROD_DB_PORT="$(remote_env_value DB_PORT "$REMOTE_ENV_CONTENT")"
 fi
 
-# Apply final fallbacks
+# Apply final fallbacks: flags win, then the remote .env, then these.
 PROD_DB_HOST="${PROD_DB_HOST:-127.0.0.1}"
 PROD_DB_PORT="${PROD_DB_PORT:-3306}"
+PROD_DB_USERNAME="${PROD_DB_USERNAME:-$PROD_SSH_USER}"
+PROD_DB_DATABASE="${PROD_DB_DATABASE:-$(basename "$PROJECT_ROOT" | tr '[:upper:]' '[:lower:]')}"
 
 # ── Read local credentials from .env ─────────────────────────────────────────
 
@@ -182,49 +207,86 @@ fi
 # ── Confirmation prompt ──────────────────────────────────────────────────────
 
 echo ""
-echo "  Live database : $PROD_DB_DATABASE @ $PROD_SSH_HOST (via SSH)"
-echo "  Local database: $LOCAL_DB_DATABASE @ $LOCAL_DB_HOST:$LOCAL_DB_PORT"
-echo ""
-echo "  WARNING: This will OVERWRITE your local database."
-echo ""
 
-if [[ -z "$ASSUME_YES" ]]; then
-    read -rp "  Proceed? [y/N] " CONFIRM
+if [[ "$DIRECTION" == "push" ]]; then
+    echo "  Source: local $LOCAL_DB_DATABASE @ $LOCAL_DB_HOST:$LOCAL_DB_PORT"
+    echo "  Target: LIVE  $PROD_DB_DATABASE @ $PROD_SSH_HOST (via SSH)"
+    echo ""
+    echo "  WARNING: This will OVERWRITE the LIVE database."
     echo ""
 
-    if [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]]; then
-        echo "Aborted."
-        exit 0
+    # -y is deliberately not honoured here: pushing to live needs its own opt-in.
+    if [[ -z "$FORCE_PUSH" ]]; then
+        CONFIRM=""
+        read -rp "  Type the live database name ($PROD_DB_DATABASE) to continue: " CONFIRM || true
+        echo ""
+
+        if [[ "$CONFIRM" != "$PROD_DB_DATABASE" ]]; then
+            echo "Aborted."
+            exit 0
+        fi
+    fi
+else
+    echo "  Live database : $PROD_DB_DATABASE @ $PROD_SSH_HOST (via SSH)"
+    echo "  Local database: $LOCAL_DB_DATABASE @ $LOCAL_DB_HOST:$LOCAL_DB_PORT"
+    echo ""
+    echo "  WARNING: This will OVERWRITE your local database."
+    echo ""
+
+    if [[ -z "$ASSUME_YES" ]]; then
+        CONFIRM=""
+        read -rp "  Proceed? [y/N] " CONFIRM || true
+        echo ""
+
+        if [[ "$CONFIRM" != "y" && "$CONFIRM" != "Y" ]]; then
+            echo "Aborted."
+            exit 0
+        fi
     fi
 fi
 
-# ── Build remote mysqldump command ───────────────────────────────────────────
+# ── Build the commands ───────────────────────────────────────────────────────
 
-REMOTE_DUMP_CMD="mysqldump \
-    --host=$PROD_DB_HOST \
-    --port=$PROD_DB_PORT \
-    --user=$PROD_DB_USERNAME \
-    --single-transaction \
-    --no-tablespaces \
-    --skip-lock-tables"
+# The remote command is a single string re-parsed by the remote shell, so every
+# value interpolated into it has to be quoted for that shell.
+REMOTE_CONN="--host=$(printf '%q' "$PROD_DB_HOST") \
+    --port=$(printf '%q' "$PROD_DB_PORT") \
+    --user=$(printf '%q' "$PROD_DB_USERNAME")"
 
+REMOTE_PWD_PREFIX=""
 if [[ -n "$PROD_DB_PASSWORD" ]]; then
-    REMOTE_DUMP_CMD="MYSQL_PWD=$PROD_DB_PASSWORD $REMOTE_DUMP_CMD"
+    REMOTE_PWD_PREFIX="MYSQL_PWD=$(printf '%q' "$PROD_DB_PASSWORD") "
 fi
 
-REMOTE_DUMP_CMD="$REMOTE_DUMP_CMD $PROD_DB_DATABASE"
+REMOTE_DUMP_CMD="${REMOTE_PWD_PREFIX}mysqldump $REMOTE_CONN \
+    --single-transaction \
+    --no-tablespaces \
+    --skip-lock-tables \
+    $(printf '%q' "$PROD_DB_DATABASE")"
 
-# ── Build local mysql import command ─────────────────────────────────────────
+REMOTE_IMPORT_CMD="${REMOTE_PWD_PREFIX}mysql $REMOTE_CONN $(printf '%q' "$PROD_DB_DATABASE")"
 
 LOCAL_MYSQL_OPTS=(--host="$LOCAL_DB_HOST" --port="$LOCAL_DB_PORT" --user="$LOCAL_DB_USERNAME")
+LOCAL_DUMP_OPTS=("${LOCAL_MYSQL_OPTS[@]}" --single-transaction --no-tablespaces --skip-lock-tables)
 
 # ── Run the sync ─────────────────────────────────────────────────────────────
 
-echo "  Dumping live database via SSH..."
-echo ""
+if [[ "$DIRECTION" == "push" ]]; then
+    echo "  Dumping local database and importing it on the live server..."
+    echo ""
 
-ssh "${SSH_OPTS[@]}" "$PROD_SSH_USER@$PROD_SSH_HOST" "$REMOTE_DUMP_CMD" \
-    | MYSQL_PWD="$LOCAL_DB_PASSWORD" mysql "${LOCAL_MYSQL_OPTS[@]}" "$LOCAL_DB_DATABASE"
+    MYSQL_PWD="$LOCAL_DB_PASSWORD" mysqldump "${LOCAL_DUMP_OPTS[@]}" "$LOCAL_DB_DATABASE" \
+        | ssh "${SSH_OPTS[@]}" "$PROD_SSH_USER@$PROD_SSH_HOST" "$REMOTE_IMPORT_CMD"
 
-echo "  Done! Local database '$LOCAL_DB_DATABASE' has been updated."
-echo ""
+    echo "  Done! Live database '$PROD_DB_DATABASE' has been updated."
+    echo ""
+else
+    echo "  Dumping live database via SSH..."
+    echo ""
+
+    ssh "${SSH_OPTS[@]}" "$PROD_SSH_USER@$PROD_SSH_HOST" "$REMOTE_DUMP_CMD" \
+        | MYSQL_PWD="$LOCAL_DB_PASSWORD" mysql "${LOCAL_MYSQL_OPTS[@]}" "$LOCAL_DB_DATABASE"
+
+    echo "  Done! Local database '$LOCAL_DB_DATABASE' has been updated."
+    echo ""
+fi
