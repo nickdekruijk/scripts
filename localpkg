@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 #
-# leaplink — swap a vendored nickdekruijk package for the local checkout beside the
+# localpkg — swap a vendored nickdekruijk package for the local checkout beside the
 # project, so you develop against your working copy without touching composer.json or
 # the lock. The link is a local act: composer install/update replaces it with the
 # release again, which is the point — nothing about it can reach a server.
 #
-#   leaplink                 list vendor/nickdekruijk/* and which are linked
-#   leaplink leap            link vendor/nickdekruijk/leap to ../nickdekruijk/leap
-#   leaplink leap template   link several at once
-#   leaplink -u leap         undo: reinstall that package from composer
+#   localpkg                 list vendor/nickdekruijk/* and which are linked
+#   localpkg leap            link vendor/nickdekruijk/leap to ../nickdekruijk/leap
+#   localpkg leap template   link several at once
+#   localpkg -u leap         undo: reinstall that package from composer
 #
 # The checkout is expected as a sibling of the project: ../nickdekruijk/<pkg>. Run from
 # the project root (where composer.json lives).
@@ -17,7 +17,7 @@ set -euo pipefail
 
 vendor_dir="vendor/nickdekruijk"
 
-die() { printf 'leaplink: %s\n' "$1" >&2; exit 1; }
+die() { printf 'localpkg: %s\n' "$1" >&2; exit 1; }
 
 [ -f composer.json ] || die "no composer.json here — run from the project root"
 [ -d "$vendor_dir" ] || die "no $vendor_dir — is this a leap project, and has composer installed?"
@@ -48,28 +48,28 @@ link_one() {
     [ -d "$checkout" ] || die "no checkout at $checkout — clone it there first"
 
     if [ -L "$target" ] && [ "$(readlink "$target")" = "../../../nickdekruijk/$pkg" ]; then
-        printf 'leaplink: %s already linked\n' "$pkg"
+        printf 'localpkg: %s already linked\n' "$pkg"
         return
     fi
 
     rm -rf "$target"
     # Relative, from vendor/nickdekruijk/, so it survives the project being moved.
     ln -s "../../../nickdekruijk/$pkg" "$target"
-    printf 'leaplink: %s -> checkout\n' "$pkg"
+    printf 'localpkg: %s -> checkout\n' "$pkg"
 }
 
 unlink_one() {
     local pkg="$1"
     local target="$vendor_dir/$pkg"
 
-    [ -L "$target" ] || { printf 'leaplink: %s is not linked\n' "$pkg"; return; }
+    [ -L "$target" ] || { printf 'localpkg: %s is not linked\n' "$pkg"; return; }
 
     # Drop the link, then let install restore the package from the lock. Not `composer
     # reinstall`: that needs the package present to reinstall it, and the link is already
     # gone. install sees it missing and puts back exactly what the lock records — the
     # release, not master.
     rm -f "$target"
-    printf 'leaplink: %s unlinked, restoring from composer…\n' "$pkg"
+    printf 'localpkg: %s unlinked, restoring from composer…\n' "$pkg"
     composer install --no-interaction
 }
 
