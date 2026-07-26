@@ -64,6 +64,20 @@ achtergrond die `-rotate` bijvult is 100% wit. Een randgemiddelde ziet dat
 verschil nauwelijks; `%[fx:maxima]` over een hoekblokje wel. Verifieer
 rechtgetrokken uitsnedes dus op de hoeken, niet alleen op de randen.
 
+**Contrast rekt de L van Lab, niet R, G en B apart.** `-contrast-stretch`
+werkt standaard per kanaal, en dan verschuift de kleurbalans: op de
+testscan liep de afstand tussen het rode en het blauwe gemiddelde van 4,7
+naar 6,9, terwijl via Lab 4,6 bleef. Gevraagd was contrast, geen
+kleurcorrectie. `-normalize` en `-auto-level` hebben hetzelfde bezwaar.
+
+De volgorde is niet vrij: contrast moet ná het rechttrekken en snijden.
+De vulling die `-rotate` bijzet is 100% wit en zou anders het witpunt
+bepalen, waardoor de stretch niets meer doet.
+
+Een sigmoïdale curve er bovenop (`-sigmoidal-contrast 2x50%`) is te veel -
+de schaduwen lopen dicht. `CLIP=0.3` levert vol bereik met sd van 19-21
+naar 28-30.
+
 **Kwartslagen kan het script niet raden.** Zonder EXIF (SANE zet
 `Orientation: TopLeft`) en zonder inhoudsherkenning valt 90/180/270 niet af
 te leiden. Aan de bounding box ook niet: liggende foto's die verticaal op de
@@ -112,3 +126,14 @@ per hoekblokje verraadt hem:
 
 Gemeten op een goede uitsnede: 83-93%. De 93% is een lichte plek in de foto
 zelf, die zit er ook zonder rechttrekken in. Een 100 is altijd fout.
+
+Let op de volgorde: dit geldt voor uitsnedes zonder `-c`. Mét `-c` haalt het
+oprekken de hoeken alsnog naar 100 en zegt de meting niets meer. Controleer
+het snijwerk dus altijd zonder `-c`.
+
+**Contrast** - deed `-c` wat het moest? Spreiding en kleurbalans:
+
+    magick out.png -colorspace Gray \
+      -format 'sd=%[fx:standard_deviation*100]\n' info:
+
+Zonder `-c` 19-21, met `-c` 28-30, en het bereik loopt dan van 0 tot 100.

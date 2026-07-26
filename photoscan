@@ -27,6 +27,7 @@ PADDING=0               # mm extra rand rond elke uitsnede (0 = strak)
 EDGEMM=1                # mm scannerrand die genegeerd wordt
 DESKEW=1                # scheve foto's rechttrekken
 ROTATE=0                # vaste kwartslag achteraf: 0, 90, 180 of 270
+CONTRAST=0              # zwart- en witpunt oprekken
 REFINE=1                # bbox per foto strak natrekken
 KEEPFULL=0              # ook de volledige plaatscan bewaren
 DEVICE=""
@@ -38,6 +39,7 @@ MASKDPI=150             # resolutie waarop gedetecteerd wordt
 DESKEWMIN=0.05          # graden: daaronder niet roteren, scheelt resamplen
 DESKEWMAX=5             # graden: daarboven is de meting niet te vertrouwen
 DESKEWPAD=3             # px die na het rechttrekken van elke zijde af gaan
+CLIP=0.3                # % pixels dat bij -c naar zwart resp. wit mag
 
 usage() {
     cat <<'EOF'
@@ -58,6 +60,7 @@ Gebruik: photoscan [opties]
   -d DEVICE     scanner-device (standaard: automatisch)
   -i BESTAND    bestaande plaatscan gebruiken i.p.v. opnieuw scannen
   -R GRADEN     alle foto's een kwartslag draaien: 90, 180 of 270
+  -c            contrast oprekken (verschoten foto's opfrissen)
   -k            de volledige plaatscan ook bewaren
   -n            alleen detecteren en tonen, niets wegschrijven
   -D            niet rechttrekken (laat de scheefstand staan)
@@ -71,6 +74,7 @@ Voorbeelden:
   photoscan -k -n                       # plaatscan bewaren om af te stellen
   photoscan -i plaat.tif -n -t 80       # drempel handmatig afstellen
   photoscan -R 90                       # foto's lagen op hun kant
+  photoscan -c                          # doffe afdrukken opfrissen
 
 Tips:
   Leg de foto's met minstens 1 cm ruimte ertussen. Klep dicht.
@@ -80,7 +84,7 @@ Tips:
 EOF
 }
 
-while getopts "o:p:r:m:f:b:t:s:a:e:d:i:R:knvDNh" opt; do
+while getopts "o:p:r:m:f:b:t:s:a:e:d:i:R:cknvDNh" opt; do
     case $opt in
         o) OUTDIR=$OPTARG ;;
         p) PREFIX=$OPTARG ;;
@@ -95,6 +99,7 @@ while getopts "o:p:r:m:f:b:t:s:a:e:d:i:R:knvDNh" opt; do
         d) DEVICE=$OPTARG ;;
         i) INPUT=$OPTARG ;;
         R) ROTATE=$OPTARG ;;
+        c) CONTRAST=1 ;;
         k) KEEPFULL=1 ;;
         n) DRYRUN=1 ;;
         v) VERBOSE=1 ;;
@@ -383,6 +388,13 @@ while read -r w h x y; do
                -crop "${DW}x${DH}+${OX}+${OY}" +repage )
     fi
     [[ "$ROTATE" -ne 0 ]] && CMD+=( -rotate "$ROTATE" )
+    # Contrast pas hier, na het strak snijden: de vulling die -rotate
+    # bijzet is 100% wit en zou anders het witpunt bepalen. Rekken gebeurt
+    # op de L van Lab, niet op R, G en B apart - per kanaal verschuift de
+    # kleurbalans, en gevraagd is contrast, geen kleurcorrectie.
+    [[ "$CONTRAST" -eq 1 ]] && CMD+=(
+        -colorspace Lab -channel R -contrast-stretch "${CLIP}%x${CLIP}%"
+        +channel -colorspace sRGB )
     CMD+=( -quality 95 -write "$OUTFILE" +delete ")" )
 done < "$TMP/regions.txt"
 
