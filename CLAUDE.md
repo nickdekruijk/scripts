@@ -45,6 +45,31 @@ Filter op "elk getal > 0", niet op de string "255".
 **Marge komt ná de verfijning.** `PADDING` voegt achtergrond toe die de
 verfijning net heeft weggehaald. Standaard 0; alleen zinvol met `-N`.
 
+**Deskew meet op het masker, niet op de foto.** `-deskew` doet een
+Radon-transform; op een binair masker klopt dat, op fotobeeld vindt het
+willekeurige hoeken - vandaar dat de oude `-D` zo slecht werkte. Het masker
+op 150 dpi is nauwkeurig genoeg: gemeten 0,168° tegen 0,196° op volle
+resolutie, een verschil van 1,7 px over een hele fotohoogte. Een extra
+threshold-pass op 600 dpi zou 2,5 s kosten voor niets.
+
+Na het draaien moet er opnieuw gesneden worden, en dat gaat op de formule,
+niet met `-trim` (zie hierboven). Voor een foto w x h onder hoek t is de
+bounding box `W = w·cos t + h·sin t` bij `H = w·sin t + h·cos t`; dat
+stelsel omgekeerd geeft de strakke maat terug. `DESKEWPAD` vangt de
+afrondingsrest op - met 0 px blijft er rotatie-achtergrond staan, met 2 px
+niet meer.
+
+**Rotatievulling is helderder dan de klep.** De klep meet 88%, maar de
+achtergrond die `-rotate` bijvult is 100% wit. Een randgemiddelde ziet dat
+verschil nauwelijks; `%[fx:maxima]` over een hoekblokje wel. Verifieer
+rechtgetrokken uitsnedes dus op de hoeken, niet alleen op de randen.
+
+**Kwartslagen kan het script niet raden.** Zonder EXIF (SANE zet
+`Orientation: TopLeft`) en zonder inhoudsherkenning valt 90/180/270 niet af
+te leiden. Aan de bounding box ook niet: liggende foto's die verticaal op de
+plaat liggen leveren een staande uitsnede op, dus een regel als "breder dan
+hoog → draaien" doet precies niets. Daarom `-R` als expliciete keuze.
+
 ## Testen zonder scanner
 
 `~/Desktop/foto-plaat.tif` is een bewaarde plaatscan (5104x7062, twee foto's).
@@ -53,22 +78,37 @@ Altijd hiermee testen:
     photoscan -i ~/Desktop/foto-plaat.tif -r 600 -n -v      # detectie + timing
     photoscan -i ~/Desktop/foto-plaat.tif -r 600 -o /tmp/t -p t -f png
 
-Verwacht: achtergrond ~87%, drempel 81%, 2 foto's van 102x233 en 103x149 mm.
+Verwacht: achtergrond ~87%, drempel 81%, 2 foto's van 102x232 en 102x148 mm,
+rechtgetrokken over -0,056° en 0,224°. De foto's liggen op hun kant; `-R 270`
+zet ze rechtop.
 
-Verifieer het resultaat numeriek, niet op het oog - meet of de buitenste
-pixels achtergrond bevatten. Let op de geometrie: links/rechts is een
-verticale strook (`2x100%`), boven/onder een horizontale (`100%x2`). Met
-`2x100%` levert `-gravity North` dezelfde strook op als `South` en meet je
-de horizontale randen dus niet.
+Verifieer het resultaat numeriek, niet op het oog. Twee metingen, want ze
+vangen verschillende fouten:
+
+**Randen** - staat er nog klepbekleding op? Let op de geometrie: links/rechts
+is een verticale strook (`3x100%`), boven/onder een horizontale (`100%x3`).
+Met `3x100%` levert `-gravity North` dezelfde strook op als `South` en meet
+je de horizontale randen dus niet.
 
     for g in West East; do
-      magick out.png -gravity $g -crop 2x100%+0+0 +repage -colorspace Gray \
+      magick out.png -gravity $g -crop 3x100%+0+0 +repage -colorspace Gray \
         -format "$g %[fx:mean*100]\n" info:
     done
     for g in North South; do
-      magick out.png -gravity $g -crop 100%x2+0+0 +repage -colorspace Gray \
+      magick out.png -gravity $g -crop 100%x3+0+0 +repage -colorspace Gray \
         -format "$g %[fx:mean*100]\n" info:
     done
 
-Klepbekleding is ~88%. Fotobeeld zit ruim daaronder (gemeten: 20-65%). Zit
+Klepbekleding is ~88%. Fotobeeld zit ruim daaronder (gemeten: 20-58%). Zit
 een rand rond de 88%, dan staat er nog achtergrond op.
+
+**Hoeken** - staat er nog rotatievulling op? Die is 100% wit, dus een maximum
+per hoekblokje verraadt hem:
+
+    for g in NorthWest NorthEast SouthWest SouthEast; do
+      magick out.png -gravity $g -crop 40x40+0+0 +repage -colorspace Gray \
+        -format "$g %[fx:maxima*100]\n" info:
+    done
+
+Gemeten op een goede uitsnede: 83-93%. De 93% is een lichte plek in de foto
+zelf, die zit er ook zonder rechttrekken in. Een 100 is altijd fout.

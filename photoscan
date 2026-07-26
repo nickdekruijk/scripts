@@ -25,7 +25,8 @@ THRESHOLD=auto          # % helderheid waarboven iets achtergrond is, of "auto"
 MINSIZE=25              # kleinste zijde in mm die nog als foto telt
 PADDING=0               # mm extra rand rond elke uitsnede (0 = strak)
 EDGEMM=1                # mm scannerrand die genegeerd wordt
-DESKEW=0                # scheve foto's rechttrekken (zwak op foto's)
+DESKEW=1                # scheve foto's rechttrekken
+ROTATE=0                # vaste kwartslag achteraf: 0, 90, 180 of 270
 REFINE=1                # bbox per foto strak natrekken
 KEEPFULL=0              # ook de volledige plaatscan bewaren
 DEVICE=""
@@ -34,6 +35,9 @@ VERBOSE=0
 INPUT=""                # bestaande scan hergebruiken i.p.v. opnieuw scannen
 
 MASKDPI=150             # resolutie waarop gedetecteerd wordt
+DESKEWMIN=0.05          # graden: daaronder niet roteren, scheelt resamplen
+DESKEWMAX=5             # graden: daarboven is de meting niet te vertrouwen
+DESKEWPAD=3             # px die na het rechttrekken van elke zijde af gaan
 
 usage() {
     cat <<'EOF'
@@ -53,9 +57,10 @@ Gebruik: photoscan [opties]
   -e MM         breedte van de te negeren scannerrand (standaard: 1)
   -d DEVICE     scanner-device (standaard: automatisch)
   -i BESTAND    bestaande plaatscan gebruiken i.p.v. opnieuw scannen
+  -R GRADEN     alle foto's een kwartslag draaien: 90, 180 of 270
   -k            de volledige plaatscan ook bewaren
   -n            alleen detecteren en tonen, niets wegschrijven
-  -D            scheve foto's proberen recht te trekken
+  -D            niet rechttrekken (laat de scheefstand staan)
   -N            bbox niet natrekken (laat de marge staan)
   -v            toon timing per stap
   -h            deze hulp
@@ -65,13 +70,17 @@ Voorbeelden:
   photoscan -r 1200 -b 16 -f tif        # archiefkwaliteit
   photoscan -k -n                       # plaatscan bewaren om af te stellen
   photoscan -i plaat.tif -n -t 80       # drempel handmatig afstellen
+  photoscan -R 90                       # foto's lagen op hun kant
 
 Tips:
   Leg de foto's met minstens 1 cm ruimte ertussen. Klep dicht.
+  Ze hoeven niet kaarsrecht te liggen: een graad of wat wordt automatisch
+  rechtgetrokken. Een kwartslag niet - die kan het script niet raden, dus
+  leg de foto's dezelfde kant op en gebruik -R.
 EOF
 }
 
-while getopts "o:p:r:m:f:b:t:s:a:e:d:i:knvDNh" opt; do
+while getopts "o:p:r:m:f:b:t:s:a:e:d:i:R:knvDNh" opt; do
     case $opt in
         o) OUTDIR=$OPTARG ;;
         p) PREFIX=$OPTARG ;;
@@ -85,15 +94,21 @@ while getopts "o:p:r:m:f:b:t:s:a:e:d:i:knvDNh" opt; do
         e) EDGEMM=$OPTARG ;;
         d) DEVICE=$OPTARG ;;
         i) INPUT=$OPTARG ;;
+        R) ROTATE=$OPTARG ;;
         k) KEEPFULL=1 ;;
         n) DRYRUN=1 ;;
         v) VERBOSE=1 ;;
-        D) DESKEW=1 ;;
+        D) DESKEW=0 ;;
         N) REFINE=0 ;;
         h) usage; exit 0 ;;
         *) usage >&2; exit 1 ;;
     esac
 done
+
+case "$ROTATE" in
+    0|90|180|270) ;;
+    *) echo "photoscan: -R moet 90, 180 of 270 zijn (was: $ROTATE)" >&2; exit 1 ;;
+esac
 
 # ImageMagick 7 heet 'magick', 6 heet 'convert'
 if command -v magick >/dev/null 2>&1; then
@@ -310,16 +325,64 @@ while read -r w h x y; do
             print cx, cy, cw, ch
         }')"
 
-    MMW=$(awk -v p="$cw" -v d="$DPI" 'BEGIN{printf "%.0f", p*25.4/d}')
-    MMH=$(awk -v p="$ch" -v d="$DPI" 'BEGIN{printf "%.0f", p*25.4/d}')
+    # Scheefstand meten op het scherpe masker, niet op de foto zelf.
+    # -deskew doet een Radon-transform op zwart/wit; op een binair masker
+    # is dat betrouwbaar, op fotobeeld vindt het willekeurige hoeken. Dat
+    # het masker op MASKDPI staat kost nauwelijks precisie: gemeten
+    # verschil met volle resolutie is 0,03 graden, ~2 px over een hele
+    # fotohoogte, en dat valt binnen DESKEWPAD.
+    ANGLE=0
+    if [[ "$DESKEW" -eq 1 ]]; then
+        a=$($IM "$TMP/sharp.png" -crop "${w}x${h}+${x}+${y}" +repage \
+            -deskew 40% -format '%[deskew:angle]' info: 2>/dev/null || true)
+        [[ "$a" =~ ^-?[0-9]+([.][0-9]+)?$ ]] || a=0
+        ANGLE=$(awk -v a="$a" -v lo="$DESKEWMIN" -v hi="$DESKEWMAX" 'BEGIN{
+            b = (a < 0) ? -a : a
+            printf "%.4f", (b < lo || b > hi) ? 0 : a
+        }')
+    fi
+    SKEWED=$(awk -v a="$ANGLE" 'BEGIN{print (a > 0 || a < 0) ? 1 : 0}')
+
+    # Na het draaien past er een kleinere rechthoek binnen het beeld. Voor
+    # een foto w x h onder hoek t geldt W = w cos t + h sin t en
+    # H = w sin t + h cos t; dat stelsel omgekeerd levert de strakke maat.
+    # Uitrekenen dus, want -trim loopt hier weer op stofjes stuk.
+    DW=$cw; DH=$ch; OX=0; OY=0
+    if [[ "$SKEWED" -eq 1 ]]; then
+        read -r DW DH OX OY <<< "$(awk -v W="$cw" -v H="$ch" -v a="$ANGLE" \
+            -v m="$DESKEWPAD" 'BEGIN{
+                r = a * 3.14159265358979 / 180
+                s = sin(r); if (s < 0) s = -s
+                c = cos(r); c2 = c*c - s*s
+                w = (W*c - H*s)/c2 - 2*m
+                h = (H*c - W*s)/c2 - 2*m
+                printf "%d %d %d %d", w, h, (W*c + H*s - w)/2, (W*s + H*c - h)/2
+            }')"
+    fi
+
+    # bij een kwartslag wisselen breedte en hoogte in de rapportage om
+    if [[ "$ROTATE" -eq 90 || "$ROTATE" -eq 270 ]]; then
+        RW=$DH; RH=$DW
+    else
+        RW=$DW; RH=$DH
+    fi
+    MMW=$(awk -v p="$RW" -v d="$DPI" 'BEGIN{printf "%.0f", p*25.4/d}')
+    MMH=$(awk -v p="$RH" -v d="$DPI" 'BEGIN{printf "%.0f", p*25.4/d}')
 
     OUTFILE="$OUTDIR/${PREFIX}-$(printf '%02d' "$N").${FORMAT}"
     printf '  %2d. %4d x %4d mm  ->  %s\n' "$N" "$MMW" "$MMH" "$(basename "$OUTFILE")"
+    [[ "$VERBOSE" -eq 1 && "$SKEWED" -eq 1 ]] && \
+        printf '      rechtgetrokken over %s graden\n' "$ANGLE" >&2
 
     [[ "$DRYRUN" -eq 1 ]] && continue
 
     CMD+=( "(" +clone -crop "${cw}x${ch}+${cx}+${cy}" +repage )
-    [[ "$DESKEW" -eq 1 ]] && CMD+=( -background white -deskew 40% +repage )
+    if [[ "$SKEWED" -eq 1 ]]; then
+        CMD+=( -background white
+               -rotate "$(awk -v a="$ANGLE" 'BEGIN{printf "%.4f", -a}')" +repage
+               -crop "${DW}x${DH}+${OX}+${OY}" +repage )
+    fi
+    [[ "$ROTATE" -ne 0 ]] && CMD+=( -rotate "$ROTATE" )
     CMD+=( -quality 95 -write "$OUTFILE" +delete ")" )
 done < "$TMP/regions.txt"
 
