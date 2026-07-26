@@ -1,0 +1,248 @@
+#!/usr/bin/env bash
+#
+# photoscan - scan meerdere foto's in een keer en snijd ze los op
+#
+# Legt de foto's in een raster op de glasplaat, scant de hele plaat een
+# keer, detecteert de losse foto's en schrijft ze als aparte bestanden weg.
+#
+# Vereist: sane-backends, imagemagick  (brew install sane-backends imagemagick)
+
+set -euo pipefail
+
+# ---------------------------------------------------------------- instellingen
+DPI=600                 # scanresolutie
+MODE=Color              # Color of Gray
+DEPTH=8                 # 8 of 16 bits per kanaal
+FORMAT=png              # png, tif of jpg
+OUTDIR="."
+PREFIX="foto"
+THRESHOLD=92            # % helderheid waarboven iets als achtergrond geldt
+MINSIZE=25              # kleinste zijde in mm die nog als foto telt
+PADDING=2               # mm extra rand rond elke uitsnede
+DESKEW=1                # scheve foto's rechttrekken
+KEEPFULL=0              # ook de volledige plaatscan bewaren
+DEVICE=""
+DRYRUN=0
+INPUT=""                # bestaande scan hergebruiken i.p.v. opnieuw scannen
+
+MASKDPI=75              # resolutie waarop gedetecteerd wordt (snel)
+
+usage() {
+    cat <<'EOF'
+photoscan - scan meerdere foto's tegelijk en snijd ze los op
+
+Gebruik: photoscan [opties]
+
+  -o DIR        uitvoermap (standaard: huidige map)
+  -p PREFIX     bestandsnaam-prefix (standaard: foto)
+  -r DPI        resolutie: 300, 600, 1200 (standaard: 600)
+  -m MODE       Color of Gray (standaard: Color)
+  -f FORMAT     png, tif of jpg (standaard: png)
+  -b DEPTH      8 of 16 bits (standaard: 8)
+  -t PCT        achtergronddrempel in % (standaard: 92)
+  -s MM         kleinste zijde die als foto telt (standaard: 25)
+  -a MM         extra rand rond elke uitsnede (standaard: 2)
+  -d DEVICE     scanner-device (standaard: automatisch)
+  -i BESTAND    bestaande plaatscan gebruiken i.p.v. opnieuw scannen
+  -k            de volledige plaatscan ook bewaren
+  -n            alleen detecteren en tonen, niets wegschrijven
+  -S            niet rechttrekken
+  -h            deze hulp
+
+Voorbeelden:
+  photoscan -o ~/Scans -p vakantie
+  photoscan -r 1200 -b 16 -f tif        # archiefkwaliteit
+  photoscan -i plaat.tif -n             # drempel afstellen zonder scannen
+
+Tips:
+  Leg de foto's met minstens 1 cm ruimte ertussen en houd ze een halve
+  centimeter van de rand. Klep dicht. Werkt de detectie niet goed op erg
+  lichte of uitgebleekte foto's, leg er dan zwart karton overheen en
+  verlaag de drempel met -t.
+EOF
+}
+
+while getopts "o:p:r:m:f:b:t:s:a:d:i:knSh" opt; do
+    case $opt in
+        o) OUTDIR=$OPTARG ;;
+        p) PREFIX=$OPTARG ;;
+        r) DPI=$OPTARG ;;
+        m) MODE=$OPTARG ;;
+        f) FORMAT=$OPTARG ;;
+        b) DEPTH=$OPTARG ;;
+        t) THRESHOLD=$OPTARG ;;
+        s) MINSIZE=$OPTARG ;;
+        a) PADDING=$OPTARG ;;
+        d) DEVICE=$OPTARG ;;
+        i) INPUT=$OPTARG ;;
+        k) KEEPFULL=1 ;;
+        n) DRYRUN=1 ;;
+        S) DESKEW=0 ;;
+        h) usage; exit 0 ;;
+        *) usage >&2; exit 1 ;;
+    esac
+done
+
+# ImageMagick 7 heet 'magick', 6 heet 'convert'
+if command -v magick >/dev/null 2>&1; then
+    IM="magick"
+    IDENT="magick identify"
+elif command -v convert >/dev/null 2>&1; then
+    IM="convert"
+    IDENT="identify"
+else
+    echo "photoscan: imagemagick niet gevonden (brew install imagemagick)" >&2
+    exit 1
+fi
+
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/photoscan.XXXXXX")
+cleanup() { rm -rf "$TMP"; }
+trap cleanup EXIT
+
+# ------------------------------------------------------------------- scannen
+if [[ -n "$INPUT" ]]; then
+    [[ -f "$INPUT" ]] || { echo "photoscan: $INPUT bestaat niet" >&2; exit 1; }
+    FULL="$INPUT"
+    echo "Bestaande scan gebruiken: $INPUT"
+else
+    command -v scanimage >/dev/null 2>&1 || {
+        echo "photoscan: scanimage niet gevonden (brew install sane-backends)" >&2
+        exit 1
+    }
+
+    if [[ -z "$DEVICE" ]]; then
+        DEVICE=$(scanimage -L 2>/dev/null \
+                 | sed -n "s/^device \`\([^']*\)'.*/\1/p" | head -1)
+        [[ -z "$DEVICE" ]] && {
+            echo "photoscan: geen scanner gevonden" >&2
+            exit 1
+        }
+    fi
+
+    FULL="$TMP/plaat.tif"
+    echo "Scannen op ${DPI} dpi (${MODE}, ${DEPTH}-bit) via ${DEVICE}..."
+    scanimage -d "$DEVICE" \
+              --format=tiff \
+              --mode "$MODE" \
+              --depth "$DEPTH" \
+              --resolution "$DPI" \
+              --expiration-time -1 \
+              --progress \
+              -o "$FULL"
+fi
+
+# -------------------------------------------------------- foto's detecteren
+# Detectie gebeurt op een sterk verkleinde kopie: veel sneller, en de
+# morfologie hoeft dan niet met enorme kernels te werken.
+SCALE=$(awk -v m="$MASKDPI" -v d="$DPI" 'BEGIN{printf "%.4f", m/d}')
+PCT=$(awk -v s="$SCALE" 'BEGIN{printf "%.4f", s*100}')
+
+# kleinste oppervlak dat nog als foto telt, gemeten op de verkleinde kopie
+MINPX=$(awk -v mm="$MINSIZE" -v dpi="$MASKDPI" \
+        'BEGIN{p=mm/25.4*dpi; printf "%d", p*p}')
+
+# rand van 2 mm zwart maken zodat donkere plaatranden geen blob worden
+EDGE=$(awk -v dpi="$MASKDPI" 'BEGIN{printf "%d", 2/25.4*dpi+1}')
+
+echo "Foto's zoeken (drempel ${THRESHOLD}%, minimaal ${MINSIZE} mm)..."
+
+$IM "$FULL" \
+    -resize "${PCT}%" \
+    -colorspace Gray \
+    -threshold "${THRESHOLD}%" \
+    -negate \
+    -morphology Close Disk:4 \
+    -shave "${EDGE}x${EDGE}" \
+    -bordercolor black -border "${EDGE}x${EDGE}" \
+    "$TMP/mask.png"
+
+read -r MW MH <<< "$($IDENT -format '%w %h' "$TMP/mask.png")"
+
+$IM "$TMP/mask.png" \
+    -define connected-components:verbose=true \
+    -define connected-components:area-threshold="$MINPX" \
+    -connected-components 8 \
+    null: > "$TMP/blobs.txt" 2>&1 || true
+
+# regels zien er zo uit:
+#   1: 240x180+60+80 179.5,169.5 43200 gray(255)
+# de achtergrond is gray(0) na negeren; alleen de witte blobs zijn foto's
+awk -v minpx="$MINPX" -v mw="$MW" -v mh="$MH" '
+    /^[[:space:]]*[0-9]+:/ {
+        bbox = $2; area = $4; color = $5
+        if (color !~ /255/) next            # zwart = achtergrond
+        if (area + 0 < minpx) next
+        split(bbox, a, /[x+]/)
+        w = a[1]; h = a[2]; x = a[3]; y = a[4]
+        if (w > mw * 0.97 && h > mh * 0.97) next   # de hele plaat
+        print w, h, x, y
+    }
+' "$TMP/blobs.txt" | sort -k4 -n -k3 -n > "$TMP/regions.txt"
+
+COUNT=$(wc -l < "$TMP/regions.txt" | tr -d ' ')
+
+if [[ "$COUNT" -eq 0 ]]; then
+    echo
+    echo "Geen foto's gevonden."
+    echo "Probeer een andere drempel, bijvoorbeeld: photoscan -t 85"
+    echo "Of bewaar de plaatscan en stel af zonder opnieuw te scannen:"
+    echo "  photoscan -k -n   en daarna   photoscan -i plaat.tif -n -t 85"
+    [[ "$KEEPFULL" -eq 1 && -z "$INPUT" ]] && cp "$FULL" "$OUTDIR/plaat.tif"
+    exit 1
+fi
+
+echo "$COUNT foto('s) gevonden."
+echo
+
+# ------------------------------------------------------------- uitsnijden
+mkdir -p "$OUTDIR"
+PADPX=$(awk -v mm="$PADDING" -v dpi="$DPI" 'BEGIN{printf "%d", mm/25.4*dpi}')
+read -r FW FH <<< "$($IDENT -format '%w %h' "$FULL")"
+FACTOR=$(awk -v s="$SCALE" 'BEGIN{printf "%.6f", 1/s}')
+
+N=0
+while read -r w h x y; do
+    N=$((N + 1))
+
+    # coordinaten terugschalen naar de volle scan, met marge
+    read -r cx cy cw ch < <(awk -v w="$w" -v h="$h" -v x="$x" -v y="$y" \
+        -v f="$FACTOR" -v pad="$PADPX" -v fw="$FW" -v fh="$FH" 'BEGIN{
+            cx = int(x*f) - pad; cy = int(y*f) - pad
+            cw = int(w*f) + 2*pad; ch = int(h*f) + 2*pad
+            if (cx < 0) { cw += cx; cx = 0 }
+            if (cy < 0) { ch += cy; cy = 0 }
+            if (cx + cw > fw) cw = fw - cx
+            if (cy + ch > fh) ch = fh - cy
+            print cx, cy, cw, ch
+        }')
+
+    MMW=$(awk -v p="$cw" -v d="$DPI" 'BEGIN{printf "%.0f", p*25.4/d}')
+    MMH=$(awk -v p="$ch" -v d="$DPI" 'BEGIN{printf "%.0f", p*25.4/d}')
+
+    OUTFILE="$OUTDIR/${PREFIX}-$(printf '%02d' "$N").${FORMAT}"
+    printf '  %2d. %4d x %4d mm  ->  %s\n' "$N" "$MMW" "$MMH" "$(basename "$OUTFILE")"
+
+    [[ "$DRYRUN" -eq 1 ]] && continue
+
+    if [[ "$DESKEW" -eq 1 ]]; then
+        $IM "$FULL" -crop "${cw}x${ch}+${cx}+${cy}" +repage \
+            -background white -deskew 40% +repage \
+            -quality 95 "$OUTFILE"
+    else
+        $IM "$FULL" -crop "${cw}x${ch}+${cx}+${cy}" +repage \
+            -quality 95 "$OUTFILE"
+    fi
+done < "$TMP/regions.txt"
+
+if [[ "$KEEPFULL" -eq 1 && -z "$INPUT" && "$DRYRUN" -eq 0 ]]; then
+    cp "$FULL" "$OUTDIR/${PREFIX}-plaat.tif"
+    echo
+    echo "Volledige plaatscan: ${PREFIX}-plaat.tif"
+fi
+
+echo
+if [[ "$DRYRUN" -eq 1 ]]; then
+    echo "Testmodus - niets weggeschreven."
+else
+    echo "Klaar: $COUNT bestand(en) in $OUTDIR"
+fi
