@@ -21,7 +21,7 @@ DEPTH=8                 # 8 of 16 bits per kanaal
 FORMAT=png              # png, tif of jpg
 OUTDIR="."
 PREFIX="foto"
-THRESHOLD=92            # % helderheid waarboven iets als achtergrond geldt
+THRESHOLD=auto          # % helderheid waarboven iets achtergrond is, of "auto"
 MINSIZE=25              # kleinste zijde in mm die nog als foto telt
 PADDING=2               # mm extra rand rond elke uitsnede
 DESKEW=0                # scheve foto's rechttrekken (zwak op foto's)
@@ -45,7 +45,7 @@ Gebruik: photoscan [opties]
   -m MODE       Color of Gray (standaard: Color)
   -f FORMAT     png, tif of jpg (standaard: png)
   -b DEPTH      8 of 16 bits (standaard: 8)
-  -t PCT        achtergronddrempel in % (standaard: 92)
+  -t PCT        achtergronddrempel in %, of "auto" (standaard: auto)
   -s MM         kleinste zijde die als foto telt (standaard: 25)
   -a MM         extra rand rond elke uitsnede (standaard: 2)
   -d DEVICE     scanner-device (standaard: automatisch)
@@ -60,12 +60,12 @@ Voorbeelden:
   photoscan -o ~/Scans -p vakantie
   photoscan -r 1200 -b 16 -f tif        # archiefkwaliteit
   photoscan -k -n                       # plaatscan bewaren om af te stellen
-  photoscan -i plaat.tif -n -t 85       # drempel afstellen zonder scannen
+  photoscan -i plaat.tif -n -t 85       # drempel handmatig afstellen
 
 Tips:
   Leg de foto's met minstens 1 cm ruimte ertussen. Klep dicht. Werkt de
-  detectie niet goed op erg lichte of uitgebleekte foto's, leg er dan
-  zwart karton overheen en verhoog de drempel met -t.
+  detectie niet goed op erg lichte foto's, leg er dan zwart karton
+  overheen en geef de drempel zelf op met -t.
 EOF
 }
 
@@ -101,7 +101,6 @@ else
     exit 1
 fi
 
-# alle cores gebruiken als de build OpenMP heeft (Homebrew op macOS vaak niet)
 if [[ -z "${MAGICK_THREAD_LIMIT:-}" ]]; then
     MAGICK_THREAD_LIMIT=$(sysctl -n hw.logicalcpu 2>/dev/null || nproc 2>/dev/null || echo 4)
     export MAGICK_THREAD_LIMIT
@@ -157,17 +156,41 @@ if [[ "$MASKW" -lt 50 || "$MASKH" -lt 50 ]]; then
     exit 1
 fi
 
-echo "Foto's zoeken (drempel ${THRESHOLD}%, minimaal ${MINSIZE} mm)..."
+echo "Foto's zoeken (minimaal ${MINSIZE} mm)..."
 T0=$(date +%s.%N)
 
-# -scale i.p.v. -resize: -resize doet dure interpolatie die een regel
-# later toch weggedrempeld wordt. -scale middelt pixels, wat scannerruis
-# meteen wegwerkt - beter dan -sample, dat ruis een-op-een doorlaat.
-# blur+drempel vervangt '-morphology Close', dat in HDRI-builds veel duurder
-# is en hetzelfde doet: kleine gaten binnen een foto dichten.
+# Stap 1: een kleine grijsversie. Dit is de enige stap die de volledige
+# scan moet inlezen; alles daarna werkt op dit kleine plaatje.
 $IM "$FULL" \
     -scale "${MASKW}x${MASKH}!" \
     -colorspace Gray \
+    -depth 8 \
+    "$TMP/gray.png"
+
+# Stap 2: drempel bepalen. De klepbekleding van de ene scanner scant als
+# 96% wit, die van de andere als 86% - een vaste waarde werkt dus niet.
+# De helderste van de vier hoeken is vrijwel zeker lege achtergrond,
+# want foto's zijn donkerder dan de klep.
+if [[ "$THRESHOLD" == "auto" ]]; then
+    BG=0
+    for g in NorthWest NorthEast SouthWest SouthEast; do
+        v=$($IM "$TMP/gray.png" -gravity "$g" -crop 60x60+0+0 +repage \
+            -format '%[fx:mean*100]' info:)
+        v=${v%.*}
+        [[ "$v" -gt "$BG" ]] && BG=$v
+    done
+    if [[ "$BG" -lt 30 ]]; then
+        echo "photoscan: achtergrond meet ${BG}% - scan lijkt donker." >&2
+        echo "photoscan: lag de klep dicht? Geef anders zelf -t op." >&2
+        exit 1
+    fi
+    THRESHOLD=$((BG - 6))
+    [[ "$THRESHOLD" -gt 97 ]] && THRESHOLD=97
+    echo "  achtergrond ~${BG}%, drempel ${THRESHOLD}%"
+fi
+
+# Stap 3: het masker zelf
+$IM "$TMP/gray.png" \
     -threshold "${THRESHOLD}%" \
     -negate \
     -blur 0x2 -threshold 30% \
@@ -179,8 +202,6 @@ timer "masker" "$T0"
 
 read -r MW MH <<< "$($IDENT -format '%w %h' "$TMP/mask.png")"
 
-# vangnet: als geometrie ooit weer verkeerd geinterpreteerd wordt, dan
-# hier stoppen in plaats van minuten op een gigapixel-masker rekenen
 if [[ "$MW" -gt $((MASKW + 20)) || "$MH" -gt $((MASKH + 20)) ]]; then
     echo "photoscan: masker is ${MW}x${MH}, verwacht ${MASKW}x${MASKH}" >&2
     echo "photoscan: geometrie verkeerd geinterpreteerd - meld dit" >&2
@@ -200,8 +221,8 @@ timer "detectie" "$T0"
 awk -v minpx="$MINPX" -v mw="$MW" -v mh="$MH" '
     /^[[:space:]]*[0-9]+:/ {
         bbox = $2; area = $4; color = $5
-        # achtergrond is gray(0); wit is gray(255), gray(65535), gray(100%)
-        # of srgb(255,255,255) afhankelijk van de build - dus: elk getal > 0
+        # wit is gray(255), gray(65535), gray(100%) of srgb(255,255,255)
+        # afhankelijk van de build - dus: elk getal > 0
         n = color; gsub(/[^0-9]/, "", n)
         if (n + 0 == 0) next
         if (area + 0 < minpx) next
@@ -218,18 +239,16 @@ if [[ "$COUNT" -eq 0 ]]; then
     mkdir -p "$OUTDIR"
     cp "$TMP/mask.png" "$OUTDIR/${PREFIX}-masker.png"
     echo
-    echo "Geen foto's gevonden."
+    echo "Geen foto's gevonden (drempel ${THRESHOLD}%)."
     echo
     echo "Bekijk ${PREFIX}-masker.png: je foto's horen daarin wit te zijn"
-    echo "op een zwarte achtergrond. Zie je zwarte vlakken waar foto's"
-    echo "liggen, verhoog dan de drempel (-t 96). Is alles wit, verlaag"
-    echo "hem juist (-t 80)."
+    echo "op een zwarte achtergrond."
     if [[ -z "$INPUT" ]]; then
         cp "$FULL" "$OUTDIR/${PREFIX}-plaat.tif"
         echo
         echo "De scan is bewaard als ${PREFIX}-plaat.tif - opnieuw scannen"
         echo "hoeft niet. Stel af met:"
-        echo "  photoscan -i ${PREFIX}-plaat.tif -r $DPI -n -t 96"
+        echo "  photoscan -i ${PREFIX}-plaat.tif -r $DPI -n -t 80"
     fi
     exit 1
 fi
