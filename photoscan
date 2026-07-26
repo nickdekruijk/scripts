@@ -23,17 +23,17 @@ OUTDIR="."
 PREFIX="foto"
 THRESHOLD=auto          # % helderheid waarboven iets achtergrond is, of "auto"
 MINSIZE=25              # kleinste zijde in mm die nog als foto telt
-PADDING=2               # mm extra rand rond elke uitsnede
+PADDING=0               # mm extra rand rond elke uitsnede (0 = strak)
 EDGEMM=1                # mm scannerrand die genegeerd wordt
 DESKEW=0                # scheve foto's rechttrekken (zwak op foto's)
-TRIM=1                  # achtergrondrand van elke uitsnede aftrimmen
+REFINE=1                # bbox per foto strak natrekken
 KEEPFULL=0              # ook de volledige plaatscan bewaren
 DEVICE=""
 DRYRUN=0
 VERBOSE=0
 INPUT=""                # bestaande scan hergebruiken i.p.v. opnieuw scannen
 
-MASKDPI=75              # resolutie waarop gedetecteerd wordt (snel)
+MASKDPI=150             # resolutie waarop gedetecteerd wordt
 
 usage() {
     cat <<'EOF'
@@ -49,14 +49,14 @@ Gebruik: photoscan [opties]
   -b DEPTH      8 of 16 bits (standaard: 8)
   -t PCT        achtergronddrempel in %, of "auto" (standaard: auto)
   -s MM         kleinste zijde die als foto telt (standaard: 25)
-  -a MM         extra rand rond elke uitsnede (standaard: 2)
-  -e MM         breedte van de te negeren scannerrand (standaard: 3)
+  -a MM         extra rand rond elke uitsnede (standaard: 0)
+  -e MM         breedte van de te negeren scannerrand (standaard: 1)
   -d DEVICE     scanner-device (standaard: automatisch)
   -i BESTAND    bestaande plaatscan gebruiken i.p.v. opnieuw scannen
   -k            de volledige plaatscan ook bewaren
   -n            alleen detecteren en tonen, niets wegschrijven
   -D            scheve foto's proberen recht te trekken
-  -N            niet trimmen (laat de marge staan)
+  -N            bbox niet natrekken (laat de marge staan)
   -v            toon timing per stap
   -h            deze hulp
 
@@ -64,12 +64,10 @@ Voorbeelden:
   photoscan -o ~/Scans -p vakantie
   photoscan -r 1200 -b 16 -f tif        # archiefkwaliteit
   photoscan -k -n                       # plaatscan bewaren om af te stellen
-  photoscan -i plaat.tif -n -e 5        # bredere scannerrand negeren
+  photoscan -i plaat.tif -n -t 75       # drempel handmatig afstellen
 
 Tips:
-  Leg de foto's met minstens 1 cm ruimte ertussen. Klep dicht. Ligt een
-  foto pal tegen de scannerrand, stel -e dan af op de breedte van de
-  donkere band die je scanner daar produceert.
+  Leg de foto's met minstens 1 cm ruimte ertussen. Klep dicht.
 EOF
 }
 
@@ -91,7 +89,7 @@ while getopts "o:p:r:m:f:b:t:s:a:e:d:i:knvDNh" opt; do
         n) DRYRUN=1 ;;
         v) VERBOSE=1 ;;
         D) DESKEW=1 ;;
-        N) TRIM=0 ;;
+        N) REFINE=0 ;;
         h) usage; exit 0 ;;
         *) usage >&2; exit 1 ;;
     esac
@@ -175,7 +173,7 @@ $IM "$FULL" \
     "$TMP/gray.png"
 
 # Stap 2: achtergrondniveau meten. De klepbekleding van de ene scanner
-# scant als 96% wit, die van de andere als 86% - een vaste drempel werkt
+# scant als 96% wit, die van de andere als 87% - een vaste drempel werkt
 # dus niet. De helderste van de vier hoeken is vrijwel zeker lege
 # achtergrond, want foto's zijn donkerder dan de klep.
 BG=0
@@ -197,13 +195,19 @@ if [[ "$THRESHOLD" == "auto" ]]; then
     echo "  achtergrond ~${BG}%, drempel ${THRESHOLD}%"
 fi
 
-# Trim-tolerantie: alles binnen de bandbreedte tussen achtergrond en
-# drempel geldt als klepbekleding en mag weg. Zo hoeft de marge niet op
-# nul, en blijft er toch geen grijze rand staan.
-FUZZ=$((BG - THRESHOLD))
-[[ "$FUZZ" -lt 3 ]] && FUZZ=3
+# Stap 3a: scherp masker, zonder blur. De blur hieronder groepeert
+# losse stukken tot een foto, maar rekt de rand ook 1-2 pixels op. Voor
+# het exact bepalen van de fotorand is dit scherpe masker nodig.
+$IM "$TMP/gray.png" \
+    -threshold "${THRESHOLD}%" \
+    -negate \
+    -morphology Open Disk:2 \
+    -shave "${EDGE}x${EDGE}" \
+    -bordercolor black -border "${EDGE}x${EDGE}" \
+    -depth 8 \
+    "$TMP/sharp.png"
 
-# Stap 3: het masker zelf
+# Stap 3b: gegroepeerd masker voor het vinden van de foto's
 $IM "$TMP/gray.png" \
     -threshold "${THRESHOLD}%" \
     -negate \
@@ -263,7 +267,7 @@ if [[ "$COUNT" -eq 0 ]]; then
         echo
         echo "De scan is bewaard als ${PREFIX}-plaat.tif - opnieuw scannen"
         echo "hoeft niet. Stel af met:"
-        echo "  photoscan -i ${PREFIX}-plaat.tif -r $DPI -n -e 5"
+        echo "  photoscan -i ${PREFIX}-plaat.tif -r $DPI -n -t 75"
     fi
     exit 1
 fi
@@ -281,6 +285,21 @@ CMD=("$IM" "$FULL")
 N=0
 while read -r w h x y; do
     N=$((N + 1))
+
+    # De blur in het groepeermasker rekt de rand op, en losse stofjes op
+    # het glas blokkeren -trim volledig. Daarom de rand hier opnieuw
+    # bepalen op het scherpe masker, binnen het gevonden gebied.
+    if [[ "$REFINE" -eq 1 ]]; then
+        rb=$($IM "$TMP/sharp.png" -crop "${w}x${h}+${x}+${y}" +repage \
+             -format '%@' info: 2>/dev/null || true)
+        if [[ "$rb" =~ ^([0-9]+)x([0-9]+)\+([0-9]+)\+([0-9]+)$ ]]; then
+            rw=${BASH_REMATCH[1]}; rh=${BASH_REMATCH[2]}
+            rx=${BASH_REMATCH[3]}; ry=${BASH_REMATCH[4]}
+            if [[ "$rw" -gt 10 && "$rh" -gt 10 ]]; then
+                x=$((x + rx)); y=$((y + ry)); w=$rw; h=$rh
+            fi
+        fi
+    fi
 
     read -r cx cy cw ch <<< "$(awk -v w="$w" -v h="$h" -v x="$x" -v y="$y" \
         -v mw="$MW" -v pad="$PADPX" -v fw="$FW" -v fh="$FH" -v e="$EDGEPX" 'BEGIN{
@@ -306,7 +325,6 @@ while read -r w h x y; do
 
     CMD+=( "(" +clone -crop "${cw}x${ch}+${cx}+${cy}" +repage )
     [[ "$DESKEW" -eq 1 ]] && CMD+=( -background white -deskew 40% +repage )
-    [[ "$TRIM" -eq 1 ]] && CMD+=( -fuzz "${FUZZ}%" -trim +repage )
     CMD+=( -quality 95 -write "$OUTFILE" +delete ")" )
 done < "$TMP/regions.txt"
 
