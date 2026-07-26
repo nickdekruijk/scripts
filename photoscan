@@ -45,7 +45,7 @@ Gebruik: photoscan [opties]
   -p PREFIX     bestandsnaam-prefix (standaard: foto)
   -r DPI        resolutie: 300, 600, 1200 (standaard: 600)
   -m MODE       Color of Gray (standaard: Color)
-  -f FORMAT     png, tif of jpg (standaard: png)
+  -f FORMAT     png, tif of jpg (standaard: jpg)
   -b DEPTH      8 of 16 bits (standaard: 8)
   -t PCT        achtergronddrempel in %, of "auto" (standaard: auto)
   -s MM         kleinste zijde die als foto telt (standaard: 25)
@@ -64,7 +64,7 @@ Voorbeelden:
   photoscan -o ~/Scans -p vakantie
   photoscan -r 1200 -b 16 -f tif        # archiefkwaliteit
   photoscan -k -n                       # plaatscan bewaren om af te stellen
-  photoscan -i plaat.tif -n -t 75       # drempel handmatig afstellen
+  photoscan -i plaat.tif -n -t 80       # drempel handmatig afstellen
 
 Tips:
   Leg de foto's met minstens 1 cm ruimte ertussen. Klep dicht.
@@ -103,11 +103,6 @@ elif command -v convert >/dev/null 2>&1; then
 else
     echo "photoscan: imagemagick niet gevonden (brew install imagemagick)" >&2
     exit 1
-fi
-
-if [[ -z "${MAGICK_THREAD_LIMIT:-}" ]]; then
-    MAGICK_THREAD_LIMIT=$(sysctl -n hw.logicalcpu 2>/dev/null || nproc 2>/dev/null || echo 4)
-    export MAGICK_THREAD_LIMIT
 fi
 
 timer() {
@@ -267,7 +262,7 @@ if [[ "$COUNT" -eq 0 ]]; then
         echo
         echo "De scan is bewaard als ${PREFIX}-plaat.tif - opnieuw scannen"
         echo "hoeft niet. Stel af met:"
-        echo "  photoscan -i ${PREFIX}-plaat.tif -r $DPI -n -t 75"
+        echo "  photoscan -i ${PREFIX}-plaat.tif -r $DPI -n -t $((THRESHOLD - 5))"
     fi
     exit 1
 fi

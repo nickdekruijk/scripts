@@ -23,7 +23,7 @@ Niet aannemen, dit is opgemeten aan een echte scan:
 - Volle plaat op 600 dpi kleur duurt ~51 s scannen. Dat domineert de looptijd,
   dus verdere optimalisatie van de ImageMagick-pijplijn levert weinig op.
 
-## Twee valkuilen - niet terugdraaien
+## Valkuilen - niet terugdraaien
 
 **Locale.** `awk`'s `printf "%.4f"` levert in nl_NL een komma. Beland die in
 een ImageMagick-geometrie, dan leest die `12,5000%` als breedte 12% bij
@@ -47,16 +47,28 @@ verfijning net heeft weggehaald. Standaard 0; alleen zinvol met `-N`.
 
 ## Testen zonder scanner
 
-`foto-plaat.tif` is een bewaarde plaatscan. Altijd hiermee testen:
+`~/Desktop/foto-plaat.tif` is een bewaarde plaatscan (5104x7062, twee foto's).
+Altijd hiermee testen:
 
-    photoscan -i foto-plaat.tif -r 600 -n -v      # detectie + timing
-    photoscan -i foto-plaat.tif -r 600 -o /tmp/t -p t
+    photoscan -i ~/Desktop/foto-plaat.tif -r 600 -n -v      # detectie + timing
+    photoscan -i ~/Desktop/foto-plaat.tif -r 600 -o /tmp/t -p t -f png
+
+Verwacht: achtergrond ~87%, drempel 81%, 2 foto's van 102x233 en 103x149 mm.
 
 Verifieer het resultaat numeriek, niet op het oog - meet of de buitenste
-pixels achtergrond bevatten:
+pixels achtergrond bevatten. Let op de geometrie: links/rechts is een
+verticale strook (`2x100%`), boven/onder een horizontale (`100%x2`). Met
+`2x100%` levert `-gravity North` dezelfde strook op als `South` en meet je
+de horizontale randen dus niet.
 
-    magick out.png -gravity West -crop 2x100%+0+0 +repage -colorspace Gray \
-      -format '%[fx:mean*100]\n' info:
+    for g in West East; do
+      magick out.png -gravity $g -crop 2x100%+0+0 +repage -colorspace Gray \
+        -format "$g %[fx:mean*100]\n" info:
+    done
+    for g in North South; do
+      magick out.png -gravity $g -crop 100%x2+0+0 +repage -colorspace Gray \
+        -format "$g %[fx:mean*100]\n" info:
+    done
 
-Klepbekleding is ~88%. Fotobeeld zit ruim daaronder. Zit een rand rond de
-88%, dan staat er nog achtergrond op.
+Klepbekleding is ~88%. Fotobeeld zit ruim daaronder (gemeten: 20-65%). Zit
+een rand rond de 88%, dan staat er nog achtergrond op.
