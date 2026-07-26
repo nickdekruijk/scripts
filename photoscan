@@ -9,6 +9,11 @@
 
 set -euo pipefail
 
+# Forceer C-locale: in o.a. nl_NL levert awk's printf komma's als
+# decimaalteken op, en die belanden dan in geometrie-argumenten voor
+# ImageMagick, dat '12,5000%' leest als breedte 12% x hoogte 5000%.
+export LC_ALL=C
+
 # ---------------------------------------------------------------- instellingen
 DPI=600                 # scanresolutie
 MODE=Color              # Color of Gray
@@ -58,10 +63,9 @@ Voorbeelden:
   photoscan -i plaat.tif -n -t 85       # drempel afstellen zonder scannen
 
 Tips:
-  Leg de foto's met minstens 1 cm ruimte ertussen en houd ze een halve
-  centimeter van de rand. Klep dicht. Werkt de detectie niet goed op erg
-  lichte of uitgebleekte foto's, leg er dan zwart karton overheen en
-  verhoog de drempel met -t.
+  Leg de foto's met minstens 1 cm ruimte ertussen. Klep dicht. Werkt de
+  detectie niet goed op erg lichte of uitgebleekte foto's, leg er dan
+  zwart karton overheen en verhoog de drempel met -t.
 EOF
 }
 
@@ -140,20 +144,29 @@ else
 fi
 
 # -------------------------------------------------------- foto's detecteren
-SCALE=$(awk -v m="$MASKDPI" -v d="$DPI" 'BEGIN{printf "%.4f", m/d}')
-PCT=$(awk -v s="$SCALE" 'BEGIN{printf "%.4f", s*100}')
+# Afmetingen als hele pixels: een percentage met decimaalteken is
+# locale-gevoelig, een integer nooit.
+read -r FW FH <<< "$($IDENT -format '%w %h' "$FULL")"
+MASKW=$(awk -v v="$FW" -v m="$MASKDPI" -v d="$DPI" 'BEGIN{printf "%d", v*m/d}')
+MASKH=$(awk -v v="$FH" -v m="$MASKDPI" -v d="$DPI" 'BEGIN{printf "%d", v*m/d}')
 MINPX=$(awk -v mm="$MINSIZE" -v dpi="$MASKDPI" 'BEGIN{p=mm/25.4*dpi; printf "%d", p*p}')
 EDGE=$(awk -v dpi="$MASKDPI" 'BEGIN{printf "%d", 2/25.4*dpi+1}')
+
+if [[ "$MASKW" -lt 50 || "$MASKH" -lt 50 ]]; then
+    echo "photoscan: scan lijkt te klein (${FW}x${FH})" >&2
+    exit 1
+fi
 
 echo "Foto's zoeken (drempel ${THRESHOLD}%, minimaal ${MINSIZE} mm)..."
 T0=$(date +%s.%N)
 
-# -sample i.p.v. -resize: er wordt een regel later toch gedrempeld, dus
-# alle interpolatie van -resize is weggegooid rekenwerk.
+# -scale i.p.v. -resize: -resize doet dure interpolatie die een regel
+# later toch weggedrempeld wordt. -scale middelt pixels, wat scannerruis
+# meteen wegwerkt - beter dan -sample, dat ruis een-op-een doorlaat.
 # blur+drempel vervangt '-morphology Close', dat in HDRI-builds veel duurder
 # is en hetzelfde doet: kleine gaten binnen een foto dichten.
 $IM "$FULL" \
-    -sample "${PCT}%" \
+    -scale "${MASKW}x${MASKH}!" \
     -colorspace Gray \
     -threshold "${THRESHOLD}%" \
     -negate \
@@ -165,6 +178,14 @@ $IM "$FULL" \
 timer "masker" "$T0"
 
 read -r MW MH <<< "$($IDENT -format '%w %h' "$TMP/mask.png")"
+
+# vangnet: als geometrie ooit weer verkeerd geinterpreteerd wordt, dan
+# hier stoppen in plaats van minuten op een gigapixel-masker rekenen
+if [[ "$MW" -gt $((MASKW + 20)) || "$MH" -gt $((MASKH + 20)) ]]; then
+    echo "photoscan: masker is ${MW}x${MH}, verwacht ${MASKW}x${MASKH}" >&2
+    echo "photoscan: geometrie verkeerd geinterpreteerd - meld dit" >&2
+    exit 1
+fi
 
 T0=$(date +%s.%N)
 $IM "$TMP/mask.png" \
@@ -219,8 +240,6 @@ echo
 # ------------------------------------------------------------- uitsnijden
 mkdir -p "$OUTDIR"
 PADPX=$(awk -v mm="$PADDING" -v dpi="$DPI" 'BEGIN{printf "%d", mm/25.4*dpi}')
-read -r FW FH <<< "$($IDENT -format '%w %h' "$FULL")"
-FACTOR=$(awk -v s="$SCALE" 'BEGIN{printf "%.6f", 1/s}')
 
 # Alle uitsnedes in EEN aanroep, zodat de scan een keer wordt gedecodeerd
 # in plaats van een keer per foto.
@@ -230,7 +249,8 @@ while read -r w h x y; do
     N=$((N + 1))
 
     read -r cx cy cw ch <<< "$(awk -v w="$w" -v h="$h" -v x="$x" -v y="$y" \
-        -v f="$FACTOR" -v pad="$PADPX" -v fw="$FW" -v fh="$FH" 'BEGIN{
+        -v mw="$MW" -v pad="$PADPX" -v fw="$FW" -v fh="$FH" 'BEGIN{
+            f = fw / mw
             cx = int(x*f) - pad; cy = int(y*f) - pad
             cw = int(w*f) + 2*pad; ch = int(h*f) + 2*pad
             if (cx < 0) { cw += cx; cx = 0 }
