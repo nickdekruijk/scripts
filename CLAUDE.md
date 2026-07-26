@@ -18,8 +18,10 @@ Niet aannemen, dit is opgemeten aan een echte scan:
   drempel van 92% vindt daardoor nul foto's: alles geldt dan als voorgrond,
   loopt aan elkaar vast tot een blob over de hele plaat, en wordt gefilterd.
   Vandaar dat de drempel uit de hoeken van de scan wordt afgeleid.
-- Donkere band langs de glasrand is 0,2 mm (onder) tot 0,7 mm (boven).
-  `EDGEMM=1` dekt dat; hoger gooit onnodig beeld weg.
+- Donkere band langs de glasrand is **niet rondom even breed**: opgemeten
+  0,85 mm boven, 0,85 mm links, en nul onder en rechts. Eén `EDGEMM` voor
+  alle vier de zijden gooit rechts en onder dus een hele millimeter beeld
+  weg dat er wel is. Het script meet de band daarom zelf op, per zijde.
 - Volle plaat op 600 dpi kleur duurt ~51 s scannen. Dat domineert de looptijd,
   dus verdere optimalisatie van de ImageMagick-pijplijn levert weinig op.
 
@@ -45,12 +47,39 @@ Filter op "elk getal > 0", niet op de string "255".
 **Marge komt ná de verfijning.** `PADDING` voegt achtergrond toe die de
 verfijning net heeft weggehaald. Standaard 0; alleen zinvol met `-N`.
 
-**Deskew meet op het masker, niet op de foto.** `-deskew` doet een
-Radon-transform; op een binair masker klopt dat, op fotobeeld vindt het
-willekeurige hoeken - vandaar dat de oude `-D` zo slecht werkte. Het masker
-op 150 dpi is nauwkeurig genoeg: gemeten 0,168° tegen 0,196° op volle
-resolutie, een verschil van 1,7 px over een hele fotohoogte. Een extra
-threshold-pass op 600 dpi zou 2,5 s kosten voor niets.
+**`-deskew` is hier onbruikbaar - de hoek komt uit een lijnfit.** De
+Radon-transform grijpt aan op de langste rechte lijn, en dat is bij een
+foto tegen de plaatrand de detectiemarge zelf: die knipt de blob daar
+kaarsrecht af. Gemeten op de testplaat meldde `-deskew` -0,31° waar de rand
++0,31° was. Niet alleen de grootte klopte niet maar ook het teken, dus de
+foto kwam er twee keer zo scheef uit als hij erin ging: +0,31° werd +0,61°.
+Precies de klacht "hij staat een halve graad scheef".
+
+In plaats daarvan wordt per zijde een rechte lijn door de fotorand gefit,
+met de afgeknotte zijden overgeslagen. Resultaat op de testplaat: +0,32°
+naar +0,02° en +0,27° naar -0,04°.
+
+Drie dingen die daarbij nodig bleken:
+
+- **Isoleren met `keep-top`.** Bounding boxes van schuin liggende foto's
+  overlappen: een hoek van foto 2 valt in de box van foto 1, en de randscan
+  pakt die hoek dan als rand. Dat gaf +6,8° waar +0,3° hoorde.
+- **Uitschieters eruit** tijdens het fitten, anders trekt een stofje of een
+  beschadigde hoek de lijn scheef.
+- **Randen met te grote spreiding verwerpen.** Loopt er lucht of een wit
+  plafond tot in de fotorand, dan valt die rand weg tegen de klep en
+  springt de meting alle kanten op. Gemeten mediaan residu: 0,1-0,3 px voor
+  een goede rand, 6,8 px voor zo een weggevallen rand. `MAXRESID` scheidt
+  die twee ruim.
+
+Het masker op 150 dpi is nauwkeurig genoeg: gemeten 0,168° tegen 0,196° op
+volle resolutie, een verschil van 1,7 px over een hele fotohoogte. Een
+extra threshold-pass op 600 dpi zou 2,5 s kosten voor niets.
+
+De tekenconventie is opgemeten aan een blok dat met `-rotate +0,5` gedraaid
+is: een verticale rand geeft dan `dx/dy = -0,5`, een horizontale
+`dy/dx = +0,5`. Het teken van de verticale randen moet dus om. Niet op
+gevoel aanpassen - dit was juist de bug.
 
 Na het draaien moet er opnieuw gesneden worden, en dat gaat op de formule,
 niet met `-trim` (zie hierboven). Voor een foto w x h onder hoek t is de
@@ -78,6 +107,25 @@ Een sigmoïdale curve er bovenop (`-sigmoidal-contrast 2x50%`) is te veel -
 de schaduwen lopen dicht. `CLIP=0.3` levert vol bereik met sd van 19-21
 naar 28-30.
 
+**EDGEMM geldt voor de detectie, de gemeten band voor het snijden.** Die
+marge is onmisbaar in het masker: zonder (`-e 0`) telt de donkere glasrand
+als voorgrond, verbindt hij alle foto's tot één blob en vindt het script er
+op de testplaat nog maar één in plaats van drie. Maar bij het uitsnijden
+moet dezelfde marge er juist niet af, want daar staat gewoon beeld. Foto's
+liggen bewust tegen de rand - dat is de enige manier om ze recht en passend
+neer te leggen - dus dit raakt vrijwel elke scan.
+
+Het opmeten gebeurt per rij, op de plekken waar de klep zichtbaar is, en
+daarvan de mediaan. Twee dingen die niet werken: het maximum per rij (één
+lichte pixel in een verder donkere rij verpest het al - alle rijen kwamen
+op 80% uit), en `asort` om de mediaan te vinden (dat is gawk, macOS heeft
+het niet; een frequentietabel over de dieptes doet hetzelfde). Uitlezen
+gaat via ASCII-PGM (`-compress none pgm:-`), want `txt:` schrijft de kleur
+per build anders op - zie de kleurnotatie-valkuil hierboven.
+
+Ziet minder dan 5% van de rand klep, dan is die zijde bedekt en valt de
+meting terug op `EDGEMM`.
+
 **Kwartslagen kan het script niet raden.** Zonder EXIF (SANE zet
 `Orientation: TopLeft`) en zonder inhoudsherkenning valt 90/180/270 niet af
 te leiden. Aan de bounding box ook niet: liggende foto's die verticaal op de
@@ -86,15 +134,51 @@ hoog → draaien" doet precies niets. Daarom `-R` als expliciete keuze.
 
 ## Testen zonder scanner
 
-`~/Desktop/foto-plaat.tif` is een bewaarde plaatscan (5104x7062, twee foto's).
-Altijd hiermee testen:
+`~/Desktop/foto-plaat.tif` is een bewaarde plaatscan (5104x7062). Altijd
+hiermee testen:
 
     photoscan -i ~/Desktop/foto-plaat.tif -r 600 -n -v      # detectie + timing
     photoscan -i ~/Desktop/foto-plaat.tif -r 600 -o /tmp/t -p t -f png
 
-Verwacht: achtergrond ~87%, drempel 81%, 2 foto's van 102x232 en 102x148 mm,
-rechtgetrokken over -0,056° en 0,224°. De foto's liggen op hun kant; `-R 270`
-zet ze rechtop.
+Gaat een uitsnede mis, schrijf dan de maskers weg met `-M masker.png`. Je
+krijgt het groepeermasker (wat als foto telt) en het scherpe masker (waar
+de randen liggen). Daar is meestal in één oogopslag te zien wat er speelt.
+
+**`foto-plaat.tif` wordt overschreven zodra er opnieuw gescand wordt.** Dat
+is al twee keer gebeurd midden in het uitzoeken, en juist de lastige plaat -
+drie foto's strak tegen de randen - was daardoor weg. Wat over de scanner
+zelf gemeten is blijft gelden; de verwachte uitvoer hierboven hoort bij de
+scan die er op dat moment lag. Bewaar een plaat die een probleem laat zien
+onder een eigen naam: `-k lastige-plaat.tif`.
+
+Die plaat is wel te herbouwen uit de uitsnedes, en dat is een bruikbare
+fixture: foto's tegen alle randen, overlappende bounding boxes, glasband
+boven en links. De hoeken worden er expres in gedraaid, dus je kunt meteen
+nameten of de deskew ze terugvindt (+0,30/+0,28/-0,12 erin, +0,32/+0,38/
+-0,13 eruit):
+
+    magick -size 5104x7062 xc:'rgb(227,227,227)' -colorspace sRGB \
+      \( foto-01.jpg -background 'rgb(227,227,227)' -rotate 0.30 \) -geometry +10+22 -composite \
+      \( foto-02.jpg -background 'rgb(227,227,227)' -rotate 0.28 \) -geometry +1670+2420 -composite \
+      \( foto-03.jpg -background 'rgb(227,227,227)' -rotate -0.12 \) -geometry +10+4890 -composite \
+      -fill 'rgb(43,43,43)' -draw 'rectangle 0,0 5103,13' -draw 'rectangle 0,0 11,7061' \
+      -depth 8 herbouw.tif
+
+De glasband moet smal genoeg blijven om binnen `EDGE` te vallen: op 600 dpi
+is 22 px na het schalen naar 150 dpi net te breed, en dan overleeft er een
+restje de `-shave`. Dat verbindt alle foto's tot één blob over de volle
+plaatbreedte. 13 px werkt. Even krap zetten in de hoogte werkt ook niet:
+onder de ~40 px tussenruimte overbrugt de blur van het groepeermasker het
+gat en lopen twee foto's samen.
+
+Voor logica die niet van de scaninhoud afhangt (nummering, optie-parsing)
+volstaat een synthetische plaat, die scant in een fractie van de tijd:
+
+    magick -size 1276x1766 xc:'gray(88%)' \
+      -fill 'gray(30%)' -draw 'rectangle 100,100 700,900' \
+      -fill 'gray(25%)' -draw 'rectangle 800,150 1150,700' \
+      -density 150 nep.tif
+    photoscan -i nep.tif -r 150 -o /tmp/t -p t
 
 Verifieer het resultaat numeriek, niet op het oog. Twee metingen, want ze
 vangen verschillende fouten:

@@ -28,8 +28,10 @@ EDGEMM=1                # mm scannerrand die genegeerd wordt
 DESKEW=1                # scheve foto's rechttrekken
 ROTATE=0                # vaste kwartslag achteraf: 0, 90, 180 of 270
 CONTRAST=0              # zwart- en witpunt oprekken
+START=0                 # eerste bestandsnummer; 0 = doortellen vanaf wat er ligt
 REFINE=1                # bbox per foto strak natrekken
-KEEPFULL=0              # ook de volledige plaatscan bewaren
+KEEPFULL=""             # bestandsnaam om de volledige plaatscan in te bewaren
+KEEPMASK=""             # bestandsnaam om het detectiemasker in te bewaren
 DEVICE=""
 DRYRUN=0
 VERBOSE=0
@@ -39,6 +41,9 @@ MASKDPI=150             # resolutie waarop gedetecteerd wordt
 DESKEWMIN=0.05          # graden: daaronder niet roteren, scheelt resamplen
 DESKEWMAX=5             # graden: daarboven is de meting niet te vertrouwen
 DESKEWPAD=3             # px die na het rechttrekken van elke zijde af gaan
+MAXRESID=1.5            # px afwijking waarboven een rand te grillig is om
+                        # de hoek uit af te leiden
+MINRESID=0.05           # en waaronder hij te glad is om een fotorand te zijn
 CLIP=0.3                # % pixels dat bij -c naar zwart resp. wit mag
 
 usage() {
@@ -61,7 +66,10 @@ Gebruik: photoscan [opties]
   -i BESTAND    bestaande plaatscan gebruiken i.p.v. opnieuw scannen
   -R GRADEN     alle foto's een kwartslag draaien: 90, 180 of 270
   -c            contrast oprekken (verschoten foto's opfrissen)
-  -k            de volledige plaatscan ook bewaren
+  -S NUMMER     bij dit nummer beginnen i.p.v. door te tellen (-S 1
+                overschrijft dus wat er ligt)
+  -k [BESTAND]  de volledige plaatscan ook bewaren (standaard: PREFIX-plaat.tif)
+  -M [BESTAND]  het detectiemasker bewaren (foto's wit, achtergrond zwart)
   -n            alleen detecteren en tonen, niets wegschrijven
   -D            niet rechttrekken (laat de scheefstand staan)
   -N            bbox niet natrekken (laat de marge staan)
@@ -71,7 +79,7 @@ Gebruik: photoscan [opties]
 Voorbeelden:
   photoscan -o ~/Scans -p vakantie
   photoscan -r 1200 -b 16 -f tif        # archiefkwaliteit
-  photoscan -k -n                       # plaatscan bewaren om af te stellen
+  photoscan -k plaat.tif -n             # plaatscan bewaren om af te stellen
   photoscan -i plaat.tif -n -t 80       # drempel handmatig afstellen
   photoscan -R 90                       # foto's lagen op hun kant
   photoscan -c                          # doffe afdrukken opfrissen
@@ -84,7 +92,27 @@ Tips:
 EOF
 }
 
-while getopts "o:p:r:m:f:b:t:s:a:e:d:i:R:cknvDNh" opt; do
+# -k en -M hebben een optionele bestandsnaam. getopts kent dat niet, dus ze
+# staan als vlag in de lijst en het volgende argument wordt er zelf bij
+# gepakt - maar alleen als het er een is en niet met een streepje begint.
+# De standaardnaam wordt pas na de lus ingevuld, want -p kan er nog achter
+# staan en bepaalt de prefix.
+# Zet het resultaat in OPTARG_OPT en niet op stdout: via $(...) zou de
+# functie in een subshell draaien en de ophoging van OPTIND verdampen.
+# De argumenten moeten mee als "$@": binnen een functie wijzen $1, $2 en
+# dus ook ${!OPTIND} naar de argumenten van de functie zelf, niet naar die
+# van het script.
+optional_arg() {
+    local next="${!OPTIND:-}"
+    if [[ -n "$next" && "$next" != -* ]]; then
+        OPTARG_OPT=$next
+        OPTIND=$((OPTIND + 1))
+    else
+        OPTARG_OPT='@standaard'
+    fi
+}
+
+while getopts "o:p:r:m:f:b:t:s:a:e:d:i:R:S:kMcnvDNh" opt; do
     case $opt in
         o) OUTDIR=$OPTARG ;;
         p) PREFIX=$OPTARG ;;
@@ -100,7 +128,9 @@ while getopts "o:p:r:m:f:b:t:s:a:e:d:i:R:cknvDNh" opt; do
         i) INPUT=$OPTARG ;;
         R) ROTATE=$OPTARG ;;
         c) CONTRAST=1 ;;
-        k) KEEPFULL=1 ;;
+        S) START=$OPTARG ;;
+        k) optional_arg "$@"; KEEPFULL=$OPTARG_OPT ;;
+        M) optional_arg "$@"; KEEPMASK=$OPTARG_OPT ;;
         n) DRYRUN=1 ;;
         v) VERBOSE=1 ;;
         D) DESKEW=0 ;;
@@ -114,6 +144,13 @@ case "$ROTATE" in
     0|90|180|270) ;;
     *) echo "photoscan: -R moet 90, 180 of 270 zijn (was: $ROTATE)" >&2; exit 1 ;;
 esac
+
+[[ "$START" =~ ^[0-9]+$ ]] || {
+    echo "photoscan: -S moet een getal zijn (was: $START)" >&2; exit 1
+}
+
+[[ "$KEEPFULL" == "@standaard" ]] && KEEPFULL="${PREFIX}-plaat.tif"
+[[ "$KEEPMASK" == "@standaard" ]] && KEEPMASK="${PREFIX}-masker.png"
 
 # ImageMagick 7 heet 'magick', 6 heet 'convert'
 if command -v magick >/dev/null 2>&1; then
@@ -169,7 +206,6 @@ MASKW=$(awk -v v="$FW" -v m="$MASKDPI" -v d="$DPI" 'BEGIN{printf "%d", v*m/d}')
 MASKH=$(awk -v v="$FH" -v m="$MASKDPI" -v d="$DPI" 'BEGIN{printf "%d", v*m/d}')
 MINPX=$(awk -v mm="$MINSIZE" -v dpi="$MASKDPI" 'BEGIN{p=mm/25.4*dpi; printf "%d", p*p}')
 EDGE=$(awk -v mm="$EDGEMM" -v dpi="$MASKDPI" 'BEGIN{printf "%d", mm/25.4*dpi+1}')
-EDGEPX=$(awk -v mm="$EDGEMM" -v dpi="$DPI" 'BEGIN{printf "%d", mm/25.4*dpi}')
 
 if [[ "$MASKW" -lt 50 || "$MASKH" -lt 50 ]]; then
     echo "photoscan: scan lijkt te klein (${FW}x${FH})" >&2
@@ -210,6 +246,53 @@ if [[ "$THRESHOLD" == "auto" ]]; then
     echo "  achtergrond ~${BG}%, drempel ${THRESHOLD}%"
 fi
 
+# Stap 2b: de donkere band langs de glasrand per zijde opmeten. Hij is
+# niet rondom even breed - op deze scanner 0,85 mm boven en links en nul
+# onder en rechts - en een foto die tegen de rand ligt verliest anders
+# beeld dat wel degelijk gescand is. EDGEMM blijft gelden voor de
+# detectie: zonder die marge verbindt de band alle foto's tot een blob
+# en vindt het script er nog maar een.
+#
+# Per rij wordt gekeken hoe diep de band reikt op de plekken waar de klep
+# zichtbaar is, en daarvan de mediaan genomen. Het maximum werkt niet: een
+# enkele lichte pixel in een verder donkere rij verpest het al. Uitlezen
+# gaat via ASCII-PGM, want txt: schrijft de kleur per build anders op.
+measure_band() {
+    local geom=$1 rot=$2
+    local pre=("$IM" "$TMP/gray.png" -crop "$geom" +repage)
+    [[ "$rot" -ne 0 ]] && pre+=(-rotate "$rot")
+    "${pre[@]}" -depth 8 -compress none pgm:- 2>/dev/null | awk -v lim="$BGLEVEL" -v fb="$EDGE" '
+        NR==1 { next }                      # P2
+        NR==2 { w=$1; h=$2; next }
+        NR==3 { next }                      # maxval
+        { for (i=1; i<=NF; i++) v[n++]=$i }
+        END {
+            for (x=0; x<w; x++)
+                for (y=0; y<h; y++) if (v[y*w+x] >= lim) { freq[y]++; m++; break }
+            if (m < w/20) { print fb; exit }   # rand bedekt: terug naar EDGEMM
+            c = 0
+            for (y=0; y<h; y++) { c += freq[y]; if (c >= m/2) { print y; exit } }
+            print 0
+        }'
+}
+
+BGLEVEL=$(awk -v b="$BG" 'BEGIN{printf "%d", (b-10)*255/100}')
+LIM=$((EDGE * 2))
+BANDT=$(measure_band "${MASKW}x${LIM}+0+0" 0)
+BANDB=$(measure_band "${MASKW}x${LIM}+0+$((MASKH - LIM))" 180)
+BANDL=$(measure_band "${LIM}x${MASKH}+0+0" 90)
+BANDR=$(measure_band "${LIM}x${MASKH}+$((MASKW - LIM))+0" 270)
+for v in BANDT BANDB BANDL BANDR; do
+    [[ "${!v}" =~ ^[0-9]+$ ]] || printf -v "$v" '%s' "$EDGE"
+done
+[[ "$VERBOSE" -eq 1 ]] && printf '    [glasrand: boven %s, rechts %s, onder %s, links %s px op %s dpi]\n' \
+    "$BANDT" "$BANDR" "$BANDB" "$BANDL" "$MASKDPI" >&2
+
+# dezelfde banden in bronpixels, voor het uitsnijden
+scale_band() { awk -v b="$1" -v f="$FW" -v m="$MASKW" 'BEGIN{printf "%d", b*f/m}'; }
+ET=$(scale_band "$BANDT"); EB=$(scale_band "$BANDB")
+EL=$(scale_band "$BANDL"); ER=$(scale_band "$BANDR")
+
 # Stap 3a: scherp masker, zonder blur. De blur hieronder groepeert
 # losse stukken tot een foto, maar rekt de rand ook 1-2 pixels op. Voor
 # het exact bepalen van de fotorand is dit scherpe masker nodig.
@@ -232,6 +315,20 @@ $IM "$TMP/gray.png" \
     -depth 8 \
     "$TMP/mask.png"
 timer "masker" "$T0"
+
+# Beide maskers wegschrijven als daarom gevraagd is: het groepeermasker
+# bepaalt wat als foto telt, het scherpe masker waar de randen liggen. Bij
+# een uitsnede die niet klopt zie je hier meteen waarom.
+if [[ -n "$KEEPMASK" ]]; then
+    mkdir -p "$OUTDIR"
+    case "$KEEPMASK" in
+        */*) mdest=$KEEPMASK ;;
+        *)   mdest="$OUTDIR/$KEEPMASK" ;;
+    esac
+    cp "$TMP/mask.png" "$mdest"
+    cp "$TMP/sharp.png" "${mdest%.*}-scherp.${mdest##*.}"
+    echo "  masker: $mdest en ${mdest%.*}-scherp.${mdest##*.}"
+fi
 
 read -r MW MH <<< "$($IDENT -format '%w %h' "$TMP/mask.png")"
 
@@ -291,22 +388,185 @@ echo "$COUNT foto('s) gevonden."
 echo
 
 # ------------------------------------------------------------- uitsnijden
+
+# Scheefstand meten door een rechte lijn door de fotorand te trekken, per
+# zijde. Dit verving -deskew, dat hier niet alleen onnauwkeurig maar ronduit
+# fout is: ligt een foto tegen de plaatrand, dan heeft de detectiemarge de
+# blob daar kaarsrecht afgekapt, en op die kunstmatige lijn grijpt de
+# Radon-transform aan. Gemeten op de testplaat meldde het -0,31 graden waar
+# de rand +0,31 was - de foto kwam er dus twee keer zo scheef uit als hij
+# erin ging (0,61 graden). De afgeknotte zijden worden daarom overgeslagen;
+# van de zijden die wel vrij liggen wordt de mediaan genomen.
+EDGERUN=$(awk -v d="$MASKDPI" 'BEGIN{r=int(d/30); print (r<3)?3:r}')
+
+measure_angle() {
+    local geom=$1 skip=$2
+    # keep-top houdt alleen de grootste component over. Bounding boxes van
+    # naburige foto's overlappen namelijk: op de testplaat steekt een hoek
+    # van foto 2 in de box van foto 1, en de randscan pakt dan die hoek als
+    # rand. Dat leverde +6,8 graden waar +0,3 hoorde.
+    "$IM" "$TMP/sharp.png" -crop "$geom" +repage \
+        -define connected-components:keep-top=1 \
+        -define connected-components:mean-color=true \
+        -connected-components 8 \
+        -depth 8 -compress none pgm:- 2>/dev/null |
+    awk -v skip="$skip" -v runlen="$EDGERUN" -v maxres="$MAXRESID" -v minres="$MINRESID" '
+    # eerste rand-pixel vanaf zijde "kind" op regel/kolom i, pas geldig na
+    # runlen aaneengesloten voorgrondpixels - een stofje telt anders al mee
+    function edge(kind, i,   j, run) {
+        run = 0
+        if (kind == "L") {
+            for (j = 0; j < w; j++)
+                if (v[i*w+j] > 127) { if (++run >= RUN) return j - RUN + 1 } else run = 0
+        } else if (kind == "R") {
+            for (j = w-1; j >= 0; j--)
+                if (v[i*w+j] > 127) { if (++run >= RUN) return j + RUN - 1 } else run = 0
+        } else if (kind == "T") {
+            for (j = 0; j < h; j++)
+                if (v[j*w+i] > 127) { if (++run >= RUN) return j - RUN + 1 } else run = 0
+        } else {
+            for (j = h-1; j >= 0; j--)
+                if (v[j*w+i] > 127) { if (++run >= RUN) return j + RUN - 1 } else run = 0
+        }
+        return -1
+    }
+    function med(n, a,   i, j, t, b) {
+        for (i = 0; i < n; i++) b[i] = a[i]
+        for (i = 1; i < n; i++) { t = b[i]; for (j = i-1; j >= 0 && b[j] > t; j--) b[j+1] = b[j]; b[j+1] = t }
+        return b[int(n/2)]
+    }
+    # kleinste-kwadraten door de rand, met uitschieters eruit: stof en
+    # beschadigde hoeken trekken de lijn anders scheef
+    function fit(kind,   lo, hi, i, e, n, mx, my, num, den, s, it, k, lim, r) {
+        if (kind == "L" || kind == "R") { lo = int(h*0.1); hi = h - lo }
+        else                            { lo = int(w*0.1); hi = w - lo }
+        n = 0
+        for (i = lo; i < hi; i += 2) {
+            e = edge(kind, i)
+            if (e >= 0) { px[n] = i; py[n] = e; n++ }
+        }
+        if (n < 30) return ""
+        for (it = 0; it < 4; it++) {
+            mx = 0; my = 0
+            for (i = 0; i < n; i++) { mx += px[i]; my += py[i] }
+            mx /= n; my /= n
+            num = 0; den = 0
+            for (i = 0; i < n; i++) { num += (px[i]-mx)*(py[i]-my); den += (px[i]-mx)*(px[i]-mx) }
+            if (den == 0) return ""
+            s = num/den
+            for (i = 0; i < n; i++) {
+                r = py[i] - (my + s*(px[i]-mx))
+                res[i] = (r < 0) ? -r : r
+            }
+            lim = 3*med(n, res); if (lim < 2) lim = 2
+            k = 0
+            for (i = 0; i < n; i++) if (res[i] <= lim) { px[k] = px[i]; py[k] = py[i]; k++ }
+            if (k < 30) break
+            n = k
+        }
+        # Hoe recht is deze rand eigenlijk? Loopt er lichte lucht of een
+        # wit plafond tot in de fotorand, dan valt die op sommige kolommen
+        # weg tegen de klep en springt de gevonden rand alle kanten op.
+        # Goede randen op de testplaat: 0,1 tot 0,3 px. Een weggevallen
+        # rand: 6,8 px. Die telt dus niet mee.
+        #
+        # Te glad telt ook niet mee. Een echte fotorand is een papierrand
+        # met stof en rafels en zit op 0,1 tot 0,4 px. Meet een rand 0,02
+        # px, dan is het geen fotorand maar iets kaarsrechts: de bounding
+        # box zelf, de detectiemarge, of een grens binnen de foto zoals de
+        # onderkant van een wit plafond. Precies dat leverde +0,006 graden
+        # op waar de zijrand -0,38 zei.
+        # Let op: dit blok staat binnen de enkele quotes van awk, dus geen
+        # apostrof gebruiken in commentaar - dat sluit de string af.
+        for (i = 0; i < n; i++) {
+            r = py[i] - (my + s*(px[i]-mx))
+            res[i] = (r < 0) ? -r : r
+        }
+        m = med(n, res)
+        if (m > maxres || m < minres) return ""
+        return s
+    }
+    NR==1 { next }                      # P2
+    NR==2 { w=$1; h=$2; next }
+    NR==3 { next }                      # maxval
+    { for (i=1; i<=NF; i++) v[n++]=$i }
+    END {
+        RUN = runlen
+        nn = 0
+        for (k = 1; k <= 4; k++) {
+            kind = substr("LRTB", k, 1)
+            if (index(skip, kind)) continue
+            s = fit(kind)
+            if (s == "") continue
+            # gekalibreerd op een blok dat met -rotate +0,5 gedraaid is:
+            # een verticale rand geeft dan dx/dy = -0,5, een horizontale
+            # dy/dx = +0,5. Het teken van de verticale moet dus om.
+            a = atan2(s, 1) * 180 / 3.14159265358979
+            ang[nn++] = (kind == "L" || kind == "R") ? -a : a
+        }
+        if (nn == 0) { print "0"; exit }
+        printf "%.4f\n", med(nn, ang)
+    }'
+}
+
 mkdir -p "$OUTDIR"
 PADPX=$(awk -v mm="$PADDING" -v dpi="$DPI" 'BEGIN{printf "%d", mm/25.4*dpi}')
+
+# Verder tellen vanaf het hoogste nummer dat er al ligt, zodat een tweede
+# plaat de eerste niet overschrijft. Gaten worden niet opgevuld: bestaande
+# nummers houden hun foto. Elke extensie telt mee, anders zou -f png over
+# een eerdere jpg-serie heen nummeren.
+N=0
+if [[ "$START" -gt 0 ]]; then
+    N=$((START - 1))
+else
+    for f in "$OUTDIR/${PREFIX}"-[0-9][0-9]*.*; do
+        [[ -e "$f" ]] || continue
+        n=${f##*/}; n=${n#"$PREFIX"-}; n=${n%%.*}
+        [[ "$n" =~ ^[0-9]+$ ]] || continue
+        n=$((10#$n))                   # 08 en 09 zijn geen octale getallen
+        [[ "$n" -gt "$N" ]] && N=$n
+    done
+    [[ "$N" -gt 0 ]] && echo "Er staan al foto's in $OUTDIR - verder vanaf $((N + 1))."
+fi
 
 # Alle uitsnedes in EEN aanroep, zodat de scan een keer wordt gedecodeerd
 # in plaats van een keer per foto.
 CMD=("$IM" "$FULL")
-N=0
 while read -r w h x y; do
     N=$((N + 1))
+
+    # Ligt de foto tegen de rand van de plaat? Het masker is daar door
+    # -shave/-border zwart gemaakt, dus de blob stopt op EDGE terwijl het
+    # beeld doorloopt. Aan zo'n zijde wordt straks tot de gemeten glasrand
+    # gesneden in plaats van tot EDGEMM. Bepalen vóór de verfijning, want
+    # die werkt binnen het gevonden gebied en haalt de blob juist naar
+    # binnen.
+    TL=0; TT=0; TR=0; TB=0
+    [[ "$x" -le "$EDGE" ]] && TL=1
+    [[ "$y" -le "$EDGE" ]] && TT=1
+    [[ $((x + w)) -ge $((MW - EDGE)) ]] && TR=1
+    [[ $((y + h)) -ge $((MH - EDGE)) ]] && TB=1
 
     # De blur in het groepeermasker rekt de rand op, en losse stofjes op
     # het glas blokkeren -trim volledig. Daarom de rand hier opnieuw
     # bepalen op het scherpe masker, binnen het gevonden gebied.
+    #
+    # Niet met -trim (%@) maar via de grootste losse component. Foto's
+    # liggen schuin, dus hun bounding boxes overlappen: in de box van foto 3
+    # op de testplaat ligt een strook van 441x26 die bij foto 2 hoort. Die
+    # raakt de bovenrand van de box, en dan haalt -trim er nul pixels af -
+    # het stuk buurfoto bleef gewoon in de uitsnede staan.
     if [[ "$REFINE" -eq 1 ]]; then
         rb=$($IM "$TMP/sharp.png" -crop "${w}x${h}+${x}+${y}" +repage \
-             -format '%@' info: 2>/dev/null || true)
+             -define connected-components:verbose=true \
+             -define connected-components:area-threshold=100 \
+             -connected-components 8 null: 2>&1 |
+             awk '/^[[:space:]]*[0-9]+:/ {
+                     n = $5; gsub(/[^0-9]/, "", n)
+                     if (n + 0 == 0) next           # zwart is achtergrond
+                     if ($4 + 0 > best) { best = $4 + 0; box = $2 }
+                 } END { print box }' || true)
         if [[ "$rb" =~ ^([0-9]+)x([0-9]+)\+([0-9]+)\+([0-9]+)$ ]]; then
             rw=${BASH_REMATCH[1]}; rh=${BASH_REMATCH[2]}
             rx=${BASH_REMATCH[3]}; ry=${BASH_REMATCH[4]}
@@ -317,29 +577,37 @@ while read -r w h x y; do
     fi
 
     read -r cx cy cw ch <<< "$(awk -v w="$w" -v h="$h" -v x="$x" -v y="$y" \
-        -v mw="$MW" -v pad="$PADPX" -v fw="$FW" -v fh="$FH" -v e="$EDGEPX" 'BEGIN{
+        -v mw="$MW" -v pad="$PADPX" -v fw="$FW" -v fh="$FH" \
+        -v et="$ET" -v eb="$EB" -v el="$EL" -v er="$ER" \
+        -v tl="$TL" -v tt="$TT" -v tr="$TR" -v tb="$TB" 'BEGIN{
             f = fw / mw
             cx = int(x*f) - pad; cy = int(y*f) - pad
             cw = int(w*f) + 2*pad; ch = int(h*f) + 2*pad
-            # nooit tot in de scannerrand snijden: die scant donkerder dan
-            # de klep en levert anders een grijze band aan die zijde
-            if (cx < e) { cw -= (e - cx); cx = e }
-            if (cy < e) { ch -= (e - cy); cy = e }
-            if (cx + cw > fw - e) cw = fw - e - cx
-            if (cy + ch > fh - e) ch = fh - e - cy
+            # Tot de glasrand en niet verder: die scant donkerder dan de
+            # klep en levert anders een grijze band aan die zijde. Lag de
+            # foto tegen de rand, dan wordt juist naar buiten toe bijgetrokken
+            # tot diezelfde glasrand - daar staat beeld dat de detectiemarge
+            # heeft afgesneden.
+            if (tl) { cw += cx - el; cx = el } else if (cx < el) { cw -= (el - cx); cx = el }
+            if (tt) { ch += cy - et; cy = et } else if (cy < et) { ch -= (et - cy); cy = et }
+            if (tr || cx + cw > fw - er) cw = fw - er - cx
+            if (tb || cy + ch > fh - eb) ch = fh - eb - cy
             print cx, cy, cw, ch
         }')"
 
-    # Scheefstand meten op het scherpe masker, niet op de foto zelf.
-    # -deskew doet een Radon-transform op zwart/wit; op een binair masker
-    # is dat betrouwbaar, op fotobeeld vindt het willekeurige hoeken. Dat
-    # het masker op MASKDPI staat kost nauwelijks precisie: gemeten
-    # verschil met volle resolutie is 0,03 graden, ~2 px over een hele
-    # fotohoogte, en dat valt binnen DESKEWPAD.
+    # Scheefstand meten op het scherpe masker, niet op de foto zelf: een
+    # rand is daar een harde overgang, in fotobeeld is er niets om op aan
+    # te grijpen. Dat het masker op MASKDPI staat kost nauwelijks precisie -
+    # het verschil met volle resolutie is ~0,03 graden, zo'n 2 px over een
+    # hele fotohoogte, en dat valt binnen DESKEWPAD.
     ANGLE=0
     if [[ "$DESKEW" -eq 1 ]]; then
-        a=$($IM "$TMP/sharp.png" -crop "${w}x${h}+${x}+${y}" +repage \
-            -deskew 40% -format '%[deskew:angle]' info: 2>/dev/null || true)
+        SKIP=""
+        [[ "$TL" -eq 1 ]] && SKIP="${SKIP}L"
+        [[ "$TR" -eq 1 ]] && SKIP="${SKIP}R"
+        [[ "$TT" -eq 1 ]] && SKIP="${SKIP}T"
+        [[ "$TB" -eq 1 ]] && SKIP="${SKIP}B"
+        a=$(measure_angle "${w}x${h}+${x}+${y}" "$SKIP" || true)
         [[ "$a" =~ ^-?[0-9]+([.][0-9]+)?$ ]] || a=0
         ANGLE=$(awk -v a="$a" -v lo="$DESKEWMIN" -v hi="$DESKEWMAX" 'BEGIN{
             b = (a < 0) ? -a : a
@@ -405,10 +673,15 @@ if [[ "$DRYRUN" -eq 0 ]]; then
     timer "uitsnijden" "$T0"
 fi
 
-if [[ "$KEEPFULL" -eq 1 && -z "$INPUT" && "$DRYRUN" -eq 0 ]]; then
-    cp "$FULL" "$OUTDIR/${PREFIX}-plaat.tif"
+if [[ -n "$KEEPFULL" && -z "$INPUT" && "$DRYRUN" -eq 0 ]]; then
+    # zonder pad in de uitvoermap, met pad precies waar het gevraagd wordt
+    case "$KEEPFULL" in
+        */*) dest=$KEEPFULL ;;
+        *)   dest="$OUTDIR/$KEEPFULL" ;;
+    esac
+    cp "$FULL" "$dest"
     echo
-    echo "Volledige plaatscan: ${PREFIX}-plaat.tif"
+    echo "Volledige plaatscan: $dest"
 fi
 
 echo
