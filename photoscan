@@ -132,8 +132,11 @@ else
 
     FULL="$TMP/plaat.tif"
     echo "Scannen op ${DPI} dpi (${MODE}, ${DEPTH}-bit) via ${DEVICE}..."
+    TSCAN=$(date +%s.%N)
     scanimage -d "$DEVICE" --format=tiff --mode "$MODE" --depth "$DEPTH" \
               --resolution "$DPI" --expiration-time -1 --progress -o "$FULL"
+    printf '  scan gereed in %.0f sec\n' \
+        "$(awk -v a="$(date +%s.%N)" -v b="$TSCAN" 'BEGIN{print a-b}')"
 fi
 
 # -------------------------------------------------------- foto's detecteren
@@ -157,6 +160,7 @@ $IM "$FULL" \
     -blur 0x2 -threshold 30% \
     -shave "${EDGE}x${EDGE}" \
     -bordercolor black -border "${EDGE}x${EDGE}" \
+    -depth 8 \
     "$TMP/mask.png"
 timer "masker" "$T0"
 
@@ -175,7 +179,10 @@ timer "detectie" "$T0"
 awk -v minpx="$MINPX" -v mw="$MW" -v mh="$MH" '
     /^[[:space:]]*[0-9]+:/ {
         bbox = $2; area = $4; color = $5
-        if (color !~ /255/) next
+        # achtergrond is gray(0); wit is gray(255), gray(65535), gray(100%)
+        # of srgb(255,255,255) afhankelijk van de build - dus: elk getal > 0
+        n = color; gsub(/[^0-9]/, "", n)
+        if (n + 0 == 0) next
         if (area + 0 < minpx) next
         split(bbox, a, /[x+]/)
         w = a[1]; h = a[2]; x = a[3]; y = a[4]
@@ -187,12 +194,22 @@ awk -v minpx="$MINPX" -v mw="$MW" -v mh="$MH" '
 COUNT=$(wc -l < "$TMP/regions.txt" | tr -d ' ')
 
 if [[ "$COUNT" -eq 0 ]]; then
+    mkdir -p "$OUTDIR"
+    cp "$TMP/mask.png" "$OUTDIR/${PREFIX}-masker.png"
     echo
     echo "Geen foto's gevonden."
-    echo "Stel de drempel af zonder opnieuw te scannen:"
-    echo "  photoscan -k -n           en daarna"
-    echo "  photoscan -i foto-plaat.tif -n -t 85"
-    [[ "$KEEPFULL" -eq 1 && -z "$INPUT" ]] && cp "$FULL" "$OUTDIR/${PREFIX}-plaat.tif"
+    echo
+    echo "Bekijk ${PREFIX}-masker.png: je foto's horen daarin wit te zijn"
+    echo "op een zwarte achtergrond. Zie je zwarte vlakken waar foto's"
+    echo "liggen, verhoog dan de drempel (-t 96). Is alles wit, verlaag"
+    echo "hem juist (-t 80)."
+    if [[ -z "$INPUT" ]]; then
+        cp "$FULL" "$OUTDIR/${PREFIX}-plaat.tif"
+        echo
+        echo "De scan is bewaard als ${PREFIX}-plaat.tif - opnieuw scannen"
+        echo "hoeft niet. Stel af met:"
+        echo "  photoscan -i ${PREFIX}-plaat.tif -r $DPI -n -t 96"
+    fi
     exit 1
 fi
 
