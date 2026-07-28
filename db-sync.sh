@@ -14,6 +14,7 @@
 #   bash scripts/db-sync.sh forge@bandpage.com bandpage
 #   bash scripts/db-sync.sh --ssh-host=bandpage.com --ssh-user=forge
 #   bash scripts/db-sync.sh forge@bandpage.com --push
+#   bash scripts/db-sync.sh forge@bandpage.com --add-drop-database
 #
 set -euo pipefail
 
@@ -49,6 +50,8 @@ usage() {
     echo "  --remote-env=PATH     Path to .env on the server (default: ~/HOST/.env)"
     echo "  --ssh-port=PORT       SSH port (default: 22)"
     echo "  --ssh-key=PATH        Path to SSH private key (default: SSH agent)"
+    echo "  --add-drop-database   Dump with --add-drop-database --databases, so the target"
+    echo "                        database is dropped and recreated before the import"
     echo "  -y, --yes             Skip the confirmation prompt (pull only)"
     echo "  --force-push          Skip the confirmation prompt when pushing to live"
     echo "  -h, --help            Show this help message"
@@ -70,12 +73,14 @@ REMOTE_ENV_PATH=""
 ASSUME_YES=""
 FORCE_PUSH=""
 DIRECTION="pull"
+ADD_DROP_DATABASE=""
 
 for arg in "$@"; do
     case "$arg" in
         --push|--to-live)   DIRECTION="push" ;;
         --pull|--from-live) DIRECTION="pull" ;;
         --force-push)       FORCE_PUSH="1" ;;
+        --add-drop-database) ADD_DROP_DATABASE="1" ;;
         --ssh-host=*)  PROD_SSH_HOST="${arg#*=}" ;;
         --ssh-user=*)  PROD_SSH_USER="${arg#*=}" ;;
         --ssh-port=*)  PROD_SSH_PORT="${arg#*=}" ;;
@@ -213,6 +218,9 @@ if [[ "$DIRECTION" == "push" ]]; then
     echo "  Target: LIVE  $PROD_DB_DATABASE @ $PROD_SSH_HOST (via SSH)"
     echo ""
     echo "  WARNING: This will OVERWRITE the LIVE database."
+    if [[ -n "$ADD_DROP_DATABASE" ]]; then
+        echo "  WARNING: Live database '$PROD_DB_DATABASE' is DROPPED and recreated first."
+    fi
     echo ""
 
     # -y is deliberately not honoured here: pushing to live needs its own opt-in.
@@ -231,6 +239,9 @@ else
     echo "  Local database: $LOCAL_DB_DATABASE @ $LOCAL_DB_HOST:$LOCAL_DB_PORT"
     echo ""
     echo "  WARNING: This will OVERWRITE your local database."
+    if [[ -n "$ADD_DROP_DATABASE" ]]; then
+        echo "  WARNING: Local database '$LOCAL_DB_DATABASE' is DROPPED and recreated first."
+    fi
     echo ""
 
     if [[ -z "$ASSUME_YES" ]]; then
@@ -247,6 +258,46 @@ fi
 
 # ── Build the commands ───────────────────────────────────────────────────────
 
+# --add-drop-database only takes effect together with --databases, which also makes
+# mysqldump emit the CREATE DATABASE and USE statements the DROP has to be followed by.
+DUMP_DATABASE_OPTS=""
+if [[ -n "$ADD_DROP_DATABASE" ]]; then
+    DUMP_DATABASE_OPTS="--add-drop-database --databases"
+fi
+
+# Those statements carry the SOURCE database name, so an import into a target with a
+# different name would recreate and fill the source name instead. Rewrite the three
+# statements that mention it; the rest of the dump never names the database.
+#
+# mysqldump wraps the DROP in a versioned comment (/*!40000 DROP DATABASE ...*/;), so
+# the lines are matched on the statement anywhere in the line, not at its start.
+rewrite_database_name() {
+    local from="$1" to="$2" bt='`'
+
+    if [[ -z "$ADD_DROP_DATABASE" || "$from" == "$to" ]]; then
+        cat
+        return
+    fi
+
+    local from_pattern
+    from_pattern="$(printf '%s' "$from" | sed -e 's/[][\\.*^$|&/]/\\&/g')"
+
+    sed \
+        -e "/DROP DATABASE IF EXISTS ${bt}${from_pattern}${bt}/s|${bt}${from_pattern}${bt}|${bt}${to}${bt}|" \
+        -e "/CREATE DATABASE .*${bt}${from_pattern}${bt}/s|${bt}${from_pattern}${bt}|${bt}${to}${bt}|" \
+        -e "/^USE ${bt}${from_pattern}${bt};/s|${bt}${from_pattern}${bt}|${bt}${to}${bt}|"
+}
+
+# A backtick in a database name would end the identifier the rewrite matches on.
+if [[ -n "$ADD_DROP_DATABASE" && "$PROD_DB_DATABASE" != "$LOCAL_DB_DATABASE" ]]; then
+    for name in "$PROD_DB_DATABASE" "$LOCAL_DB_DATABASE"; do
+        if [[ "$name" == *'`'* ]]; then
+            echo "Error: --add-drop-database cannot rename a database whose name contains a backtick."
+            exit 1
+        fi
+    done
+fi
+
 # The remote command is a single string re-parsed by the remote shell, so every
 # value interpolated into it has to be quoted for that shell.
 REMOTE_CONN="--host=$(printf '%q' "$PROD_DB_HOST") \
@@ -262,12 +313,25 @@ REMOTE_DUMP_CMD="${REMOTE_PWD_PREFIX}mysqldump $REMOTE_CONN \
     --single-transaction \
     --no-tablespaces \
     --skip-lock-tables \
+    $DUMP_DATABASE_OPTS \
     $(printf '%q' "$PROD_DB_DATABASE")"
 
-REMOTE_IMPORT_CMD="${REMOTE_PWD_PREFIX}mysql $REMOTE_CONN $(printf '%q' "$PROD_DB_DATABASE")"
+# A dump that drops and recreates the database selects it itself, and naming it on the
+# command line would fail while it does not exist yet.
+REMOTE_IMPORT_TARGET=" $(printf '%q' "$PROD_DB_DATABASE")"
+if [[ -n "$ADD_DROP_DATABASE" ]]; then
+    REMOTE_IMPORT_TARGET=""
+fi
+
+REMOTE_IMPORT_CMD="${REMOTE_PWD_PREFIX}mysql $REMOTE_CONN$REMOTE_IMPORT_TARGET"
 
 LOCAL_MYSQL_OPTS=(--host="$LOCAL_DB_HOST" --port="$LOCAL_DB_PORT" --user="$LOCAL_DB_USERNAME")
-LOCAL_DUMP_OPTS=("${LOCAL_MYSQL_OPTS[@]}" --single-transaction --no-tablespaces --skip-lock-tables)
+LOCAL_DUMP_OPTS=("${LOCAL_MYSQL_OPTS[@]}" --single-transaction --no-tablespaces --skip-lock-tables $DUMP_DATABASE_OPTS)
+
+LOCAL_IMPORT_OPTS=("${LOCAL_MYSQL_OPTS[@]}")
+if [[ -z "$ADD_DROP_DATABASE" ]]; then
+    LOCAL_IMPORT_OPTS+=("$LOCAL_DB_DATABASE")
+fi
 
 # ── Run the sync ─────────────────────────────────────────────────────────────
 
@@ -276,6 +340,7 @@ if [[ "$DIRECTION" == "push" ]]; then
     echo ""
 
     MYSQL_PWD="$LOCAL_DB_PASSWORD" mysqldump "${LOCAL_DUMP_OPTS[@]}" "$LOCAL_DB_DATABASE" \
+        | rewrite_database_name "$LOCAL_DB_DATABASE" "$PROD_DB_DATABASE" \
         | ssh "${SSH_OPTS[@]}" "$PROD_SSH_USER@$PROD_SSH_HOST" "$REMOTE_IMPORT_CMD"
 
     echo "  Done! Live database '$PROD_DB_DATABASE' has been updated."
@@ -285,7 +350,8 @@ else
     echo ""
 
     ssh "${SSH_OPTS[@]}" "$PROD_SSH_USER@$PROD_SSH_HOST" "$REMOTE_DUMP_CMD" \
-        | MYSQL_PWD="$LOCAL_DB_PASSWORD" mysql "${LOCAL_MYSQL_OPTS[@]}" "$LOCAL_DB_DATABASE"
+        | rewrite_database_name "$PROD_DB_DATABASE" "$LOCAL_DB_DATABASE" \
+        | MYSQL_PWD="$LOCAL_DB_PASSWORD" mysql "${LOCAL_IMPORT_OPTS[@]}"
 
     echo "  Done! Local database '$LOCAL_DB_DATABASE' has been updated."
     echo ""
