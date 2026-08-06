@@ -1,0 +1,209 @@
+#!/usr/bin/env bash
+#
+# claude-backup — Archive and restore your local Claude Code history and setup.
+#
+# Everything Claude Code keeps lives in ~/.claude/ plus ~/.claude.json. None of it
+# is synced anywhere, so a new machine starts empty unless you carry it over.
+#
+# Caches are skipped; they are rebuilt automatically. Credentials are NOT included:
+# they live in the macOS Keychain, so you log in again on the new machine.
+#
+# Usage:
+#   claude-backup archive                       # → ~/Desktop/claude-backup-YYYY-MM-DD.tar.gz
+#   claude-backup archive /tmp/mine.tar.gz
+#   claude-backup restore /tmp/mine.tar.gz
+#   claude-backup restore /tmp/mine.tar.gz --target /tmp/testrun
+#
+set -euo pipefail
+export LC_ALL=C
+
+# Claude Code deletes transcripts older than this many days. It is NOT set by
+# default, and the built-in default is 30 — which silently eats your history,
+# on the new machine too. See the warnings below.
+RETENTION_KEY="cleanupPeriodDays"
+
+# Rebuilt on demand, so there is no point carrying them across.
+EXCLUDES=(
+    --exclude='.claude/cache'
+    --exclude='.claude/shell-snapshots'
+    --exclude='.claude/sessions'
+    --exclude='.claude/ide'
+    --exclude='.claude/plugins/cache'
+    --exclude='.claude/mcp-needs-auth-cache.json'
+    --exclude='.claude/vscode-claude-status-cache.json'
+    --exclude='.claude/.last-cleanup'
+    --exclude='*.lock'
+    --exclude='.DS_Store'
+)
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+die()  { echo "error: $*" >&2; exit 1; }
+warn() { echo "!! $*" >&2; }
+
+usage() {
+    # Print the header comment, minus the shebang, up to the first line of code.
+    awk 'NR==1 {next} /^#/ {sub(/^# ?/, ""); print; next} {exit}' "$0"
+    exit "${1:-0}"
+}
+
+# Refuse to touch the files while a session is writing to them: a transcript
+# caught mid-write lands in the archive truncated.
+check_not_running() {
+    local force=$1 pids
+    pids=$(pgrep -x claude 2>/dev/null || true)
+    [[ -z $pids ]] && return 0
+    if [[ $force == yes ]]; then
+        warn "Claude Code is running (pid: $(echo "$pids" | tr '\n' ' ')) — continuing because of --force."
+        return 0
+    fi
+    die "Claude Code is running (pid: $(echo "$pids" | tr '\n' ' ')).
+       Quit it first, or pass --force if you accept a possibly truncated transcript."
+}
+
+# Reads a top-level key from a JSON file. Empty output means absent.
+json_get() {
+    python3 -c "
+import json,sys
+try:
+    print(json.load(open(sys.argv[1])).get(sys.argv[2], ''))
+except Exception:
+    pass
+" "$1" "$2"
+}
+
+retention_warning() {
+    cat >&2 <<EOF
+
+!! $RETENTION_KEY is not set in settings.json.
+   Claude Code then falls back to 30 days and deletes older transcripts — also
+   on the new machine, right after you restore, because their timestamps are old.
+   Add this to ~/.claude/settings.json before you rely on this archive:
+
+       "$RETENTION_KEY": 3650
+
+EOF
+}
+
+# ── archive ──────────────────────────────────────────────────────────────────
+
+do_archive() {
+    local out="" force=no
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --force) force=yes ;;
+            -h|--help) usage ;;
+            -*) die "unknown option: $1" ;;
+            *) out=$1 ;;
+        esac
+        shift
+    done
+    [[ -z $out ]] && out="$HOME/Desktop/claude-backup-$(date +%Y-%m-%d).tar.gz"
+
+    [[ -d $HOME/.claude ]] || die "no ~/.claude found — nothing to archive."
+    check_not_running "$force"
+
+    local retention
+    retention=$(json_get "$HOME/.claude/settings.json" "$RETENTION_KEY")
+    [[ -z $retention ]] && retention_warning
+
+    # ~/.claude.json holds project settings and MCP server definitions. It is
+    # small but not optional: without it the new machine forgets every project.
+    local members=(.claude)
+    [[ -f $HOME/.claude.json ]] && members+=(.claude.json)
+
+    echo "Archiving ${members[*]} → $out"
+    mkdir -p "$(dirname "$out")"
+    tar -czf "$out" -C "$HOME" "${EXCLUDES[@]}" "${members[@]}"
+
+    # Report what actually landed in the archive, not what we hoped would.
+    local sessions projects oldest
+    # Only transcripts under projects/ — history.jsonl and friends are .jsonl too.
+    sessions=$(tar -tzf "$out" | grep -c '^\.claude/projects/.*\.jsonl$' || true)
+    projects=$(tar -tzf "$out" | sed -n 's#^\.claude/projects/\([^/]*\)/.*#\1#p' | sort -u | wc -l | tr -d ' ')
+    oldest=$(find "$HOME/.claude/projects" -name '*.jsonl' -exec stat -f '%m' {} + 2>/dev/null \
+             | sort -n | head -1)
+
+    echo
+    echo "  archive   $(du -h "$out" | cut -f1)  $out"
+    echo "  sessions  $sessions transcripts across $projects projects"
+    [[ -n $oldest ]] && echo "  oldest    $(date -r "$oldest" '+%Y-%m-%d')"
+    [[ -n $retention ]] && echo "  retention $retention days"
+    echo
+    echo "Copy this file to the new machine, then run:"
+    echo "  claude-backup restore $(basename "$out")"
+}
+
+# ── restore ──────────────────────────────────────────────────────────────────
+
+do_restore() {
+    local archive="" target="$HOME" force=no
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --target) target=${2:?--target needs a directory}; shift ;;
+            --target=*) target=${1#*=} ;;
+            --force) force=yes ;;
+            -h|--help) usage ;;
+            -*) die "unknown option: $1" ;;
+            *) archive=$1 ;;
+        esac
+        shift
+    done
+    [[ -n $archive ]] || die "which archive? usage: claude-backup restore <archive.tar.gz>"
+    [[ -f $archive ]] || die "no such archive: $archive"
+
+    tar -tzf "$archive" | grep -q '^\.claude/settings\.json$' \
+        || die "$archive does not look like a claude-backup archive (no .claude/settings.json)."
+
+    check_not_running "$force"
+    mkdir -p "$target"
+
+    # Never overwrite: an existing ~/.claude may hold sessions from the new
+    # machine that are not in the archive. Move it aside instead.
+    local stamp; stamp=$(date +%Y-%m-%d-%H%M%S)
+    local item
+    for item in .claude .claude.json; do
+        if [[ -e $target/$item ]]; then
+            echo "Moving existing $target/$item → $target/$item.pre-restore-$stamp"
+            mv "$target/$item" "$target/$item.pre-restore-$stamp"
+        fi
+    done
+
+    echo "Restoring $archive → $target"
+    tar -xzf "$archive" -C "$target"
+
+    local sessions retention
+    sessions=$(find "$target/.claude/projects" -name '*.jsonl' 2>/dev/null | wc -l | tr -d ' ')
+    retention=$(json_get "$target/.claude/settings.json" "$RETENTION_KEY")
+
+    echo
+    echo "  restored  $sessions transcripts"
+    if [[ -n $retention ]]; then
+        echo "  retention $retention days"
+    else
+        retention_warning
+    fi
+
+    [[ $target != "$HOME" ]] && { echo; echo "(--target given, so your real ~/.claude was untouched)"; return 0; }
+
+    cat <<'EOF'
+
+Still to do by hand — these are not in the archive:
+
+  1. claude          log in again; credentials live in the macOS Keychain
+  2. gh auth login   same story for the GitHub token
+  3. MCP servers     re-authorise sentry and claude-design; claude.ai connectors
+                     via the connector settings on claude.ai
+  4. outside Claude  ~/.laravel-forge/config.json and your SSH keys
+
+EOF
+}
+
+# ── main ─────────────────────────────────────────────────────────────────────
+
+case ${1:-} in
+    archive) shift; do_archive "$@" ;;
+    restore) shift; do_restore "$@" ;;
+    -h|--help|"") usage ;;
+    *) die "unknown command: $1 (expected 'archive' or 'restore')" ;;
+esac
