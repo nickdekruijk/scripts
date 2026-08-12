@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+#
+# claude-session-times — restore the modification time of Claude Code session
+# files to the moment the conversation actually ended.
+#
+# Updating the Claude Code VS Code extension rewrites the session files of the
+# workspace that happens to be open, appending an index record such as
+# {"type":"last-prompt",...} to every transcript that lacks one. Appending
+# updates the file's mtime, and the resume picker orders sessions by mtime, so
+# a whole batch of unrelated conversations collapses onto the update timestamp
+# and reads as "1m ago". The damage accumulates: every update flattens another
+# block, and with enough history the list stops being chronological at all.
+#
+# Nothing is lost, only mislabelled. The real time is still in the `timestamp`
+# field of the messages inside each transcript, so it can be put back. This
+# script does exactly that and nothing else — it never writes to the files
+# themselves, only to their mtime. Safe to re-run after every update.
+#
+# Usage:
+#   claude-session-times                        # dry run over every project
+#   claude-session-times --apply
+#   claude-session-times mysite --apply         # only projects matching "mysite"
+#   claude-session-times --all                  # also list files already correct
+#
+# Exit status is 1 when a dry run found drift, so it can gate a cron job.
+
+import json
+import os
+import sys
+from datetime import datetime, timezone
+
+PROJECTS = os.path.expanduser("~/.claude/projects")
+
+# Below this the difference is the write of the final message itself, not an
+# update batch. Nothing worth touching, and it keeps the report readable.
+TOLERANCE_SECONDS = 60
+
+# Transcripts run to tens of megabytes, and the newest messages are at the end,
+# so read backwards in growing bites instead of parsing the whole thing.
+TAIL_SIZES = (64 * 1024, 4 * 1024 * 1024, None)
+
+
+def newest_timestamp(text: str) -> datetime | None:
+    """Latest `timestamp` among the JSON lines in this text, if any.
+
+    Lines without a timestamp (index records, summaries) and the truncated
+    first line of a tail read are skipped.
+    """
+    newest = None
+    for line in text.splitlines():
+        if '"timestamp"' not in line:
+            continue
+        try:
+            stamp = json.loads(line).get("timestamp")
+        except (json.JSONDecodeError, AttributeError):
+            continue
+        if not isinstance(stamp, str):
+            continue
+        try:
+            parsed = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        if newest is None or parsed > newest:
+            newest = parsed
+    return newest
+
+
+def last_message_time(path: str) -> float | None:
+    """Unix time of the last message in a transcript, or None if unreadable."""
+    size = os.path.getsize(path)
+    with open(path, "rb") as handle:
+        for tail in TAIL_SIZES:
+            if tail is None:
+                handle.seek(0)
+            elif tail >= size:
+                handle.seek(0)
+                tail = None
+            else:
+                handle.seek(size - tail)
+            found = newest_timestamp(handle.read().decode("utf-8", "replace"))
+            if found:
+                return found.timestamp()
+            if tail is None:
+                return None
+    return None
+
+
+def project_dirs(patterns: list[str]) -> list[str]:
+    if not os.path.isdir(PROJECTS):
+        sys.exit(f"claude-session-times: no {PROJECTS}")
+    names = sorted(
+        name for name in os.listdir(PROJECTS)
+        if os.path.isdir(os.path.join(PROJECTS, name))
+    )
+    if patterns:
+        names = [n for n in names if any(p.lower() in n.lower() for p in patterns)]
+    return [os.path.join(PROJECTS, name) for name in names]
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    apply_changes = "--apply" in argv
+    show_all = "--all" in argv
+    patterns = [arg for arg in argv if not arg.startswith("-")]
+
+    fmt = "%Y-%m-%d %H:%M"
+    total_files = 0
+    total_drift = 0
+
+    for directory in project_dirs(patterns):
+        rows = []
+        for name in os.listdir(directory):
+            if not name.endswith(".jsonl"):
+                continue
+            path = os.path.join(directory, name)
+            real = last_message_time(path)
+            if real is None:
+                continue
+            current = os.path.getmtime(path)
+            drift = abs(current - real)
+            if drift > TOLERANCE_SECONDS and apply_changes:
+                os.utime(path, (real, real))
+            rows.append((real, current, drift, name))
+
+        if not rows:
+            continue
+        total_files += len(rows)
+        drifted = [row for row in rows if row[2] > TOLERANCE_SECONDS]
+        total_drift += len(drifted)
+        if not drifted and not show_all:
+            continue
+
+        print(f"\n{os.path.basename(directory)}  ({len(drifted)}/{len(rows)})")
+        for real, current, drift, name in sorted(show_all and rows or drifted):
+            marker = "  " if drift <= TOLERANCE_SECONDS else "->"
+            was = datetime.fromtimestamp(current).strftime(fmt)
+            now = datetime.fromtimestamp(real).strftime(fmt)
+            print(f"  {marker} {name[:8]}  {was} -> {now}  {drift / 3600:5.1f}h off")
+
+    if apply_changes:
+        print(f"\nRestored {total_drift} of {total_files} session files.")
+        return 0
+
+    print(f"\n{total_drift} of {total_files} session files have the wrong mtime.")
+    if total_drift:
+        print("Re-run with --apply to restore them.")
+    return 1 if total_drift else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
