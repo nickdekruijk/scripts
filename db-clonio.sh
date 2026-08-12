@@ -136,7 +136,10 @@ fi
 
 # ── Build SSH options ────────────────────────────────────────────────────────
 
-SSH_OPTS=(-o StrictHostKeyChecking=no -p "$PROD_SSH_PORT")
+# accept-new, niet no: een onbekende host wordt zonder vragen toegevoegd, maar een
+# veranderde hostkey blijft een harde fout. Met "no" zou een omgeleide verbinding
+# stilzwijgend geaccepteerd worden, en daar gaan wel de productie-credentials overheen.
+SSH_OPTS=(-o StrictHostKeyChecking=accept-new -p "$PROD_SSH_PORT")
 if [[ -n "$PROD_SSH_KEY" ]]; then
     PROD_SSH_KEY="${PROD_SSH_KEY/#\~/$HOME}"
     SSH_OPTS+=(-i "$PROD_SSH_KEY")
