@@ -1,0 +1,72 @@
+#!/bin/bash
+#
+# rspamd-anon - maskeert e-mailadressen van eigen domeinen in rspamd/exim logs
+#
+# Gebruik:
+#   tail -n1000 /var/log/rspamd/rspamd.log | rspamd-anon
+#   rspamd-anon < bericht.eml
+#   grep "iets" /var/log/exim/mainlog | rspamd-anon
+#
+# Adressen op eigen domeinen worden vervangen door een stabiele hash,
+# zodat hetzelfde adres herkenbaar blijft als hetzelfde. Externe domeinen
+# (spammers, mailinglijsten) blijven onaangetast zodat patronen zichtbaar zijn.
+
+SALT_FILE="/etc/rspamd-anon.salt"
+
+# Salt aanmaken bij eerste gebruik; zonder salt is een hash terug te rekenen
+if [ ! -f "$SALT_FILE" ]; then
+    head -c32 /dev/urandom | base64 > "$SALT_FILE"
+    chmod 600 "$SALT_FILE"
+fi
+
+# Domeinenlijst opbouwen uit DirectAdmin
+DOMAINS=$(mktemp)
+trap 'rm -f "$DOMAINS"' EXIT
+
+if [ -f /etc/virtual/domains ]; then
+    grep -v '^\s*$' /etc/virtual/domains > "$DOMAINS"
+else
+    # Fallback: mapnamen onder /etc/virtual zijn de domeinen
+    find /etc/virtual -maxdepth 1 -mindepth 1 -type d -printf '%f\n' > "$DOMAINS"
+fi
+
+perl -e '
+use strict;
+use Digest::MD5 qw(md5_hex);
+
+my $salt_file   = shift;
+my $domain_file = shift;
+
+open(my $sf, "<", $salt_file) or die "salt: $!";
+my $salt = <$sf>; chomp $salt; close $sf;
+
+# Eigen domeinen inlezen
+my %own;
+open(my $df, "<", $domain_file) or die "domains: $!";
+while (<$df>) { chomp; s/^\s+|\s+$//g; $own{lc $_} = 1 if length; }
+close $df;
+
+sub anon {
+    my ($local, $domain) = @_;
+    my $h = substr(md5_hex($salt . lc($local) . lc($domain)), 0, 10);
+    return "user-$h\@$domain";
+}
+
+while (my $line = <STDIN>) {
+    # Adres alleen maskeren als het domein (of het bovenliggende domein) van ons is
+    $line =~ s{
+        ([a-zA-Z0-9._%+=-]+) @ ([a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)+)
+    }{
+        my ($l, $d) = ($1, $2);
+        my $match = 0;
+        my $probe = lc $d;
+        while ($probe =~ /\./) {
+            if ($own{$probe}) { $match = 1; last }
+            $probe =~ s/^[^.]+\.//;
+        }
+        $match ? anon($l, $d) : "$l\@$d";
+    }gex;
+
+    print $line;
+}
+' "$SALT_FILE" "$DOMAINS"
