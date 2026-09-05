@@ -17,6 +17,7 @@ Run any of them with `--help` (or `-h`) for the full option list.
 | [`claude-backup`](claude-backup) | Archive and restore your local Claude Code history and setup, to carry it to a new machine. Caches and credentials are excluded. |
 | [`claude-session-times`](claude-session-times) | Restore the mtime of Claude Code session files to when the conversation actually ended, so the resume picker is chronological again after an extension update. |
 | [`rspamd-anon`](rspamd-anon) | Mask email addresses of your own domains in rspamd/exim logs with a stable salted hash, so you can share logs without leaking your users. External domains are left intact. |
+| [`load-monitor/`](load-monitor/) | Logs the load average every minute and, when it spikes, writes a snapshot of what the server is doing: memory per account, php-fpm workers per pool, swap, OOM kills, live web traffic and the Apache scoreboard. To the cron mail and to disk. |
 
 ## Requirements
 
@@ -28,6 +29,7 @@ Per script, roughly:
 - `photoscan`: `sane-backends` and `imagemagick` (`brew install sane-backends imagemagick`)
 - `claude-backup`, `claude-session-times`: Claude Code, and Python 3 for the latter
 - `rspamd-anon`: a mail server with rspamd or exim, Perl, and write access to `/etc`
+- `load-monitor/load-monitor`: a Linux server with `flock`, `ss`, `vmstat`, `curl` and a `mysql` client
 
 The two database scripts and `localpkg` are aimed at Laravel projects and read
 local credentials from the project's `.env`.

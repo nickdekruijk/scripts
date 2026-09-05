@@ -1,0 +1,10 @@
+# /etc/cron.d/load-monitor
+#
+# load-monitor logs the load every minute to /var/log/load.log and, at load >= 6,
+# writes a snapshot of what the server is doing to /var/log/load-snapshots and
+# mails the same text. Settings in /etc/load-monitor.conf.
+#
+# Leave MAILTO pointing somewhere a human reads: the mail is the alert, the file
+# on disk is the record that survives inbox cleanups.
+MAILTO=root
+* * * * * root /usr/local/sbin/load-monitor

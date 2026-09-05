@@ -1,0 +1,201 @@
+#!/bin/bash
+#
+# load-monitor - logs the load average every minute and, when it is high,
+# captures a snapshot of what the server is doing at that moment.
+#
+# Built to replace a php cron script that mailed a snapshot on high load. The
+# mail turned out to be the only record of several incidents, and mail gets
+# deleted, so this one also writes the snapshot to disk. It also captures the
+# things that had to be reconstructed afterwards from sar and log archives:
+# who holds the memory, which php-fpm pool is full, whether the box is
+# swapping, and which requests are in flight right now.
+#
+# Every run:
+#   - appends "epoch<TAB>load1<TAB>load5<TAB>load15" to LOG
+#
+# When load1 >= THRESHOLD, or when called with "debug":
+#   - prints a snapshot to stdout (cron mails it) and writes the same text to
+#     SNAPSHOT_DIR/YYYY-MM-DD_HHMMSS.txt, kept RETENTION_DAYS days
+#   - the snapshot contains: top, connections per IP, D-state processes, the
+#     MySQL processlist, memory per account and per process, php-fpm workers
+#     per pool, vmstat (swap in/out), OOM-killer messages, web traffic of the
+#     last two minutes per domain and IP, and the Apache scoreboard (requests
+#     in flight, with how long each has been running)
+#
+# What it deliberately does not do: restart anything. The script it replaced
+# restarted nginx and httpd at load >= 6. That cost about a minute of CPU on
+# a box with ModSecurity, and because it keyed off the lagging one-minute
+# average it regularly fired a second time when the real problem was already
+# over. The second peak in those mails was the restart itself.
+#
+# Configuration lives in CONF (default /etc/load-monitor.conf), see
+# load-monitor.conf.example. Everything server specific goes there, so this
+# file is the same on every machine.
+#
+# Usage:
+#   load-monitor            normal run (this is what cron calls, every minute)
+#   load-monitor debug      force a snapshot at any load, useful for testing
+#   load-monitor --help
+#
+# Requires bash, flock, ss, vmstat, curl and top. mysql for the processlist.
+# Linux only (GNU date, /proc).
+
+set -u
+export LC_ALL=C   # never let a locale turn 0.27 into 0,27 in the log
+
+CONF="${LOAD_MONITOR_CONF:-/etc/load-monitor.conf}"
+
+# ---- defaults, overridable in CONF -----------------------------------------
+THRESHOLD=6
+LOG=/var/log/load.log
+SNAPSHOT_DIR=/var/log/load-snapshots
+RETENTION_DAYS=90
+LOCK=/run/load-monitor.lock
+LOCK_COUNT=/run/load-monitor.lockcount
+SELF_IPS="127.0.0.1"
+STATUS_URL="https://127.0.0.1:8081/server-status"
+STATUS_HOSTS=""
+STATUS_USER=info
+STATUS_PW=""
+MYSQL_CONF=/usr/local/directadmin/conf/mysql.conf
+DOMAIN_LOGS=/var/log/nginx/domains
+
+case "${1:-}" in
+    -h|--help) sed -n '3,43p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+esac
+DEBUG=0; [ "${1:-}" = "debug" ] && DEBUG=1
+
+# shellcheck disable=SC1090
+[ -r "$CONF" ] && . "$CONF"
+
+# ---- one instance at a time -------------------------------------------------
+# A snapshot takes a few seconds; cron fires every minute. If the previous run
+# still holds the lock, skip this minute, and only complain when that happens
+# twice in a row.
+exec 9>"$LOCK"
+if ! flock -n 9; then
+    n=$(( $(cat "$LOCK_COUNT" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$LOCK_COUNT"
+    [ "$n" -ge 2 ] && echo "$(date '+%b %d %H:%M:%S')	$LOCK held for $n consecutive runs"
+    exit 0
+fi
+echo 0 > "$LOCK_COUNT"
+
+# ---- load, straight from the kernel -----------------------------------------
+read -r L1 L5 L15 _ < /proc/loadavg
+printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$L1" "$L5" "$L15" >> "$LOG"
+
+high=$(awk -v l="$L1" -v t="$THRESHOLD" 'BEGIN{print (l+0 >= t+0) ? 1 : 0}')
+[ "$high" = 1 ] || [ "$DEBUG" = 1 ] || exit 0
+
+# ---- snapshot ---------------------------------------------------------------
+snapshot() {
+    echo "$(date '+%d-%m %H:%M:%S') The server is heavily loaded: $L1, $L5, $L15"
+    echo
+
+    echo "TOP 10"; echo "================================"
+    top -bn1 2>/dev/null | head -17
+    echo
+
+    echo "TOP 10 CONNECTIONS (per IP; own IPs are reverse-proxy traffic)"; echo "================================"
+    ss -Htn state established 2>/dev/null | awk '{print $4}' | sed 's/:[0-9]*$//; s/[][]//g' \
+        | sort | uniq -c | sort -rn | head -10
+    echo
+
+    echo "PROCESSES IN D STATE (waiting on disk)"; echo "================================"
+    ps -eo user,pid,stat,pcpu,pmem,comm --no-headers | awk '$3 ~ /^D/' | head -10
+    echo "(empty = none)"; echo
+
+    echo "MYSQL PROCESSLIST (non-sleeping)"; echo "================================"
+    if [ -r "$MYSQL_CONF" ] && command -v mysql >/dev/null 2>&1; then
+        # credentials through a temp defaults file, never on the command line
+        local cnf; cnf=$(mktemp) && chmod 600 "$cnf"
+        awk -F= '/^(user|passwd|password)=/{k=$1; sub(/^passwd$/,"password",k); print k"="$2}' "$MYSQL_CONF" \
+            | sed '1i [client]' > "$cnf"
+        mysql --defaults-extra-file="$cnf" -e 'SHOW FULL PROCESSLIST' 2>&1 \
+            | awk -F'\t' 'NR==1 || $5 != "Sleep"' | cut -c1-220
+        echo "sleeping connections: $(mysql --defaults-extra-file="$cnf" -N -e 'SHOW PROCESSLIST' 2>/dev/null | awk -F'\t' '$5=="Sleep"' | wc -l)"
+        rm -f "$cnf"
+    else
+        echo "skipped: $MYSQL_CONF not readable or mysql client missing"
+    fi
+    echo
+
+    echo "1. MEMORY PER ACCOUNT (RSS in MB, top 10)"; echo "--------------------------------"
+    ps -eo user:20,rss --no-headers | awk '{s[$1]+=$2} END{for(u in s) printf "%7d MB  %s\n", s[u]/1024, u}' | sort -rn | head -10
+    echo "   per process name (RSS; shared memory counted once per process, so nginx with ModSecurity looks inflated)"
+    ps -eo rss,comm --no-headers | awk '{s[$2]+=$1} END{for(c in s) printf "%7d MB  %s\n", s[c]/1024, c}' | sort -rn | head -8
+    echo
+
+    echo "2. PHP-FPM WORKERS PER POOL (top 12)"; echo "--------------------------------"
+    ps -eo user:20,comm --no-headers | awk '$2 ~ /^php-fpm/ {c[$1" "$2]++} END{for(k in c) printf "%4d  %s\n", c[k], k}' | sort -rn | head -12
+    echo
+
+    echo "3. VMSTAT (si/so = swap in/out per second, r = run queue, wa = iowait)"; echo "--------------------------------"
+    vmstat 1 3 2>/dev/null | tail -4
+    echo
+
+    echo "4. OOM KILLER (last 5 messages in dmesg)"; echo "--------------------------------"
+    dmesg -T 2>/dev/null | grep -iE "out of memory|oom-killer|killed process" | tail -5
+    echo "(empty = none)"; echo
+
+    echo "5. WEB TRAFFIC, LAST 2 MINUTES (only logs written to in that window)"; echo "--------------------------------"
+    local m1 m0 tmp n self_re
+    m1=$(date +%d/%b/%Y:%H:%M); m0=$(date -d '-1 min' +%d/%b/%Y:%H:%M)
+    tmp=$(mktemp)
+    find "$DOMAIN_LOGS" -name "*.log" ! -name "*.error.log" -mmin -2 2>/dev/null | head -40 | while read -r f; do
+        tail -n 500 "$f" | grep -F -e "[$m1" -e "[$m0" \
+            | awk -v d="$(basename "$f" .log)" -F'"' '{split($1,a," "); print d "\t" a[1] "\t" $3 "\t" $6}'
+    done > "$tmp"
+    n=$(wc -l < "$tmp"); echo "requests: $n"
+    if [ "$n" -gt 0 ]; then
+        self_re=$(echo "$SELF_IPS" | sed 's/ /|/g; s/\./\\./g')
+        echo "   domains:";      awk -F'\t' '{c[$1]++} END{for(k in c) printf "%6d  %s\n", c[k], k}' "$tmp" | sort -rn | head -5
+        echo "   client IPs (own IPs excluded):"; awk -F'\t' -v re="^($self_re)$" '$2 !~ re {c[$2]++} END{for(k in c) printf "%6d  %s\n", c[k], k}' "$tmp" | sort -rn | head -5
+        echo "   status codes:"; awk -F'\t' '{split($3,s," "); c[s[1]]++} END{for(k in c) printf "%6d  %s\n", c[k], k}' "$tmp" | sort -rn | head -5
+        echo "   user agents:";  awk -F'\t' '{c[$4]++} END{for(k in c) printf "%6d  %.90s\n", c[k], k}' "$tmp" | sort -rn | head -3
+    fi
+    rm -f "$tmp"; echo
+
+    echo "6. APACHE SERVER-STATUS (requests in flight right now)"; echo "--------------------------------"
+    # Read straight from Apache, not through the reverse proxy. On DirectAdmin
+    # the default vhost answers this path with a silent 500 and non-www names
+    # with a 301 to www, so STATUS_HOSTS lists a few healthy www hostnames and
+    # the first one that returns the real page wins. <Location /server-status>
+    # is global in httpd-info.conf, so any sane vhost serves it.
+    local body code host ok=0
+    body=$(mktemp)
+    if [ -z "$STATUS_PW" ] || [ -z "$STATUS_HOSTS" ]; then
+        echo "   skipped: set STATUS_PW and STATUS_HOSTS in $CONF"
+    else
+        for host in $STATUS_HOSTS; do
+            code=$(curl -sk -o "$body" -w '%{http_code}' -m 5 -u "$STATUS_USER:$STATUS_PW" -H "Host: $host" "$STATUS_URL")
+            if [ "$code" = "200" ] && grep -q "Apache Server Status" "$body"; then ok=1; break; fi
+            [ "$code" = "401" ] && break
+        done
+        if [ "$ok" = 1 ]; then
+            curl -sk -m 5 -u "$STATUS_USER:$STATUS_PW" -H "Host: $host" "$STATUS_URL?auto" \
+                | awk -F': ' '/^(BusyWorkers|IdleWorkers|ReqPerSec)/ {printf "%s=%s  ", $1, $2} END{print ""}'
+            echo "   busy workers (M=W):  sec  client            vhost                          request"
+            # scoreboard rows span several source lines: join first, then split on </tr>
+            awk '/<table border="0">/{f=1} f' "$body" | tr -d '\n' \
+                | sed -e 's#</tr>#\n#g' -e 's#</t[dh]>#\t#g' -e 's#<[^>]*>##g' \
+                | awk -F'\t' '$4=="W" && $15 !~ /server-status/ {printf "   %4s  %-17s %-30s %.70s\n", $6, $12, $14, $15}' \
+                | sort -rn | head -15
+        elif [ "$code" = "401" ]; then
+            echo "   server-status returned 401: the password for user $STATUS_USER has apparently changed. Update STATUS_PW in $CONF."
+        else
+            echo "   server-status not reachable via STATUS_HOSTS (last HTTP code ${code:-none})"
+        fi
+    fi
+    rm -f "$body"; echo
+
+    echo "LISTENING SOCKETS"; echo "================================"
+    ss -Hltnp 2>/dev/null | awk '{print $4, $6}' | sed 's/users:(("//; s/",.*//' | sort -u | head -30
+}
+
+mkdir -p "$SNAPSHOT_DIR" && chmod 700 "$SNAPSHOT_DIR"
+out="$SNAPSHOT_DIR/$(date +%Y-%m-%d_%H%M%S).txt"
+snapshot 2>&1 | tee "$out"
+chmod 600 "$out" 2>/dev/null
+find "$SNAPSHOT_DIR" -maxdepth 1 -name '*.txt' -mtime +"$RETENTION_DAYS" -delete 2>/dev/null
+exit 0

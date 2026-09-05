@@ -1,0 +1,43 @@
+# /etc/load-monitor.conf - settings for load-monitor. Mode 600, root only:
+# it holds the password for Apache's /server-status page.
+#
+# Every line is plain shell; the script sources this file. Anything you leave
+# out keeps the default from the script.
+
+# Load1 at or above this value triggers a snapshot.
+THRESHOLD=6
+
+# One line per minute: epoch, load1, load5, load15, tab separated.
+LOG=/var/log/load.log
+
+# Snapshots go here as YYYY-MM-DD_HHMMSS.txt and are removed after this many days.
+SNAPSHOT_DIR=/var/log/load-snapshots
+RETENTION_DAYS=90
+
+# IPs to leave out of the per-IP counts. Behind nginx_apache the server's own
+# IP shows up as the busiest "client", because nginx proxies to Apache over it.
+# 203.0.113.10 below is a documentation address (RFC 5737, TEST-NET-3), not a
+# real one; put your server's public IP here.
+SELF_IPS="203.0.113.10 127.0.0.1"
+
+# Apache's status page, read straight from Apache on its TLS port, not through
+# nginx. The Location is global, so any healthy vhost serves it; the first host
+# in STATUS_HOSTS that returns the real page wins. On DirectAdmin the default
+# vhost gives a silent 500 and non-www names a 301, so list www hostnames, and
+# prefer ones you control over customer domains.
+STATUS_URL="https://127.0.0.1:8081/server-status"
+STATUS_HOSTS="www.example.com www.example.org"
+STATUS_USER=info
+# DirectAdmin's CustomBuild protects /server-status with basic auth and stores
+# the generated password only as a hash in /var/www/passwd-server-status. Set
+# your own with
+#   htpasswd -b /var/www/passwd-server-status info '<this value>'
+# and put it here. If the page starts answering 401, it has been regenerated:
+# repeat both steps.
+STATUS_PW=""
+
+# DirectAdmin's MySQL credentials file (user=..., passwd=...).
+MYSQL_CONF=/usr/local/directadmin/conf/mysql.conf
+
+# Per-domain nginx access logs, used for the "last 2 minutes" traffic block.
+DOMAIN_LOGS=/var/log/nginx/domains
