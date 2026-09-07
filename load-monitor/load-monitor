@@ -42,6 +42,10 @@
 
 set -u
 export LC_ALL=C   # never let a locale turn 0.27 into 0,27 in the log
+# cron on EL7 runs with PATH=/usr/bin:/bin, and ss lives in /usr/sbin. Without
+# this the connections and listening-sockets blocks come out empty under cron
+# while working fine from an interactive shell.
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 CONF="${LOAD_MONITOR_CONF:-/etc/load-monitor.conf}"
 
@@ -148,9 +152,10 @@ snapshot() {
     done > "$tmp"
     n=$(wc -l < "$tmp"); echo "requests: $n"
     if [ "$n" -gt 0 ]; then
-        self_re=$(echo "$SELF_IPS" | sed 's/ /|/g; s/\./\\./g')
+        # via ENVIRON, not -v: awk -v processes backslash escapes and warns on \.
+        SELF_RE="^($(echo "$SELF_IPS" | sed 's/ /|/g; s/\./\\./g'))$"; export SELF_RE
         echo "   domains:";      awk -F'\t' '{c[$1]++} END{for(k in c) printf "%6d  %s\n", c[k], k}' "$tmp" | sort -rn | head -5
-        echo "   client IPs (own IPs excluded):"; awk -F'\t' -v re="^($self_re)$" '$2 !~ re {c[$2]++} END{for(k in c) printf "%6d  %s\n", c[k], k}' "$tmp" | sort -rn | head -5
+        echo "   client IPs (own IPs excluded):"; awk -F'\t' '$2 !~ ENVIRON["SELF_RE"] {c[$2]++} END{for(k in c) printf "%6d  %s\n", c[k], k}' "$tmp" | sort -rn | head -5
         echo "   status codes:"; awk -F'\t' '{split($3,s," "); c[s[1]]++} END{for(k in c) printf "%6d  %s\n", c[k], k}' "$tmp" | sort -rn | head -5
         echo "   user agents:";  awk -F'\t' '{c[$4]++} END{for(k in c) printf "%6d  %.90s\n", c[k], k}' "$tmp" | sort -rn | head -3
     fi
