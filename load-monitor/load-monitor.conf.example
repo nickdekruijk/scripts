@@ -28,12 +28,12 @@ SELF_IPS="203.0.113.10 127.0.0.1"
 STATUS_URL="https://127.0.0.1:8081/server-status"
 STATUS_HOSTS="www.example.com www.example.org"
 STATUS_USER=info
-# DirectAdmin's CustomBuild protects /server-status with basic auth and stores
-# the generated password only as a hash in /var/www/passwd-server-status. Set
-# your own with
-#   htpasswd -b /var/www/passwd-server-status info '<this value>'
-# and put it here. If the page starts answering 401, it has been regenerated:
-# repeat both steps.
+# CustomBuild protects /server-status with basic auth, generates the password,
+# and writes it in plain text to the file below ("# Username:" / "# Password:").
+# Both are regenerated on every ./build rewrite_confs, so the script reads the
+# file at runtime. Leave STATUS_PW empty unless you manage the password yourself
+# (htpasswd -b /var/www/passwd-server-status info ...); a set STATUS_PW wins.
+STATUS_PW_FILE=/etc/httpd/conf/extra/httpd-info.conf.secret
 STATUS_PW=""
 
 # DirectAdmin's MySQL credentials file (user=..., passwd=...).

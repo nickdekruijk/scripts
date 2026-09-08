@@ -72,17 +72,15 @@ non-www names with a 301 to www. So `STATUS_HOSTS` lists a couple of www
 hostnames and the first that returns the real page wins. Prefer hostnames you
 control: a customer domain works until the customer leaves.
 
-**The password is not where you think.** CustomBuild protects the page with
-basic auth and writes the generated password only as a hash to
-`/var/www/passwd-server-status`. Nobody has it in plain text. Set your own:
-
-```sh
-htpasswd -b /var/www/passwd-server-status info 'your-password'
-```
-
-and put it in `STATUS_PW`. If the block ever reports a 401, CustomBuild has
-regenerated it; repeat both steps. The rest of the snapshot keeps working
-either way.
+**The password is regenerated on every rewrite.** CustomBuild protects the
+page with basic auth, generates the password, and writes it to
+`/etc/httpd/conf/extra/httpd-info.conf.secret` as `# Username:` and
+`# Password:` lines. Every `./build rewrite_confs` replaces both the hash and
+that file, so a password copied into a config breaks on the next rewrite.
+The script therefore reads the file at runtime (`STATUS_PW_FILE`). Set
+`STATUS_PW` only if you manage the password yourself with `htpasswd -b`. If
+the block ever reports a 401 anyway, the two files disagree; the rest of the
+snapshot keeps working either way.
 
 ## Parsing note
 

@@ -61,6 +61,10 @@ STATUS_URL="https://127.0.0.1:8081/server-status"
 STATUS_HOSTS=""
 STATUS_USER=info
 STATUS_PW=""
+# CustomBuild writes the generated /server-status credentials here and regenerates
+# the file on every ./build rewrite_confs. Read it at runtime so a rewrite cannot
+# break the status block. STATUS_PW, if set, overrides it.
+STATUS_PW_FILE=/etc/httpd/conf/extra/httpd-info.conf.secret
 MYSQL_CONF=/usr/local/directadmin/conf/mysql.conf
 DOMAIN_LOGS=/var/log/nginx/domains
 
@@ -101,7 +105,7 @@ snapshot() {
     echo
 
     echo "TOP 10 CONNECTIONS (per IP; own IPs are reverse-proxy traffic)"; echo "================================"
-    ss -Htn state established 2>/dev/null | awk '{print $4}' | sed 's/:[0-9]*$//; s/[][]//g' \
+    ss -Htn state established 2>/dev/null | awk '{print $4}' | sed 's/:[0-9]*$//; s/[][]//g; s/^::ffff://' \
         | sort | uniq -c | sort -rn | head -10
     echo
 
@@ -167,18 +171,23 @@ snapshot() {
     # with a 301 to www, so STATUS_HOSTS lists a few healthy www hostnames and
     # the first one that returns the real page wins. <Location /server-status>
     # is global in httpd-info.conf, so any sane vhost serves it.
-    local body code host ok=0
+    local body code host ok=0 pw="$STATUS_PW"
+    if [ -z "$pw" ] && [ -r "$STATUS_PW_FILE" ]; then
+        pw=$(sed -nE 's/^#?[[:space:]]*[Pp]assword:[[:space:]]*([^[:space:]]+).*/\1/p' "$STATUS_PW_FILE" | head -1)
+        u=$(sed -nE 's/^#?[[:space:]]*[Uu]sername:[[:space:]]*([^[:space:]]+).*/\1/p' "$STATUS_PW_FILE" | head -1)
+        [ -n "$u" ] && STATUS_USER=$u
+    fi
     body=$(mktemp)
-    if [ -z "$STATUS_PW" ] || [ -z "$STATUS_HOSTS" ]; then
-        echo "   skipped: set STATUS_PW and STATUS_HOSTS in $CONF"
+    if [ -z "$pw" ] || [ -z "$STATUS_HOSTS" ]; then
+        echo "   skipped: no password (STATUS_PW or readable STATUS_PW_FILE) or no STATUS_HOSTS in $CONF"
     else
         for host in $STATUS_HOSTS; do
-            code=$(curl -sk -o "$body" -w '%{http_code}' -m 5 -u "$STATUS_USER:$STATUS_PW" -H "Host: $host" "$STATUS_URL")
+            code=$(curl -sk -o "$body" -w '%{http_code}' -m 5 -u "$STATUS_USER:$pw" -H "Host: $host" "$STATUS_URL")
             if [ "$code" = "200" ] && grep -q "Apache Server Status" "$body"; then ok=1; break; fi
             [ "$code" = "401" ] && break
         done
         if [ "$ok" = 1 ]; then
-            curl -sk -m 5 -u "$STATUS_USER:$STATUS_PW" -H "Host: $host" "$STATUS_URL?auto" \
+            curl -sk -m 5 -u "$STATUS_USER:$pw" -H "Host: $host" "$STATUS_URL?auto" \
                 | awk -F': ' '/^(BusyWorkers|IdleWorkers|ReqPerSec)/ {printf "%s=%s  ", $1, $2} END{print ""}'
             echo "   busy workers (M=W):  sec  client            vhost                          request"
             # scoreboard rows span several source lines: join first, then split on </tr>
@@ -187,7 +196,7 @@ snapshot() {
                 | awk -F'\t' '$4=="W" && $15 !~ /server-status/ {printf "   %4s  %-17s %-30s %.70s\n", $6, $12, $14, $15}' \
                 | sort -rn | head -15
         elif [ "$code" = "401" ]; then
-            echo "   server-status returned 401: the password for user $STATUS_USER has apparently changed. Update STATUS_PW in $CONF."
+            echo "   server-status returned 401 for user $STATUS_USER: credentials in $STATUS_PW_FILE (or STATUS_PW) no longer match /var/www/passwd-server-status."
         else
             echo "   server-status not reachable via STATUS_HOSTS (last HTTP code ${code:-none})"
         fi
