@@ -139,7 +139,7 @@ remote_env_value() {
         | cut -d'=' -f2- \
         | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
               -e "s/^'//" -e "s/'$//" \
-              -e 's/^"//' -e 's/"$//'
+              -e 's/^"//' -e 's/"$//' || true
 }
 
 if [[ -n "$REMOTE_ENV_PATH" ]]; then
@@ -159,7 +159,7 @@ fi
 REMOTE_ENV_CONTENT="$(ssh -n "${SSH_OPTS[@]}" "$PROD_SSH_USER@$PROD_SSH_HOST" "$REMOTE_ENV_LOOKUP" 2>/dev/null || true)"
 
 # The lookup marks which file it found, so the run is auditable.
-REMOTE_ENV_FOUND="$(echo "$REMOTE_ENV_CONTENT" | grep -E '^# db-sync-env: ' | head -1 | cut -d' ' -f3-)"
+REMOTE_ENV_FOUND="$(echo "$REMOTE_ENV_CONTENT" | grep -E '^# db-sync-env: ' | head -1 | cut -d' ' -f3- || true)"
 if [[ -n "$REMOTE_ENV_FOUND" ]]; then
     REMOTE_ENV_PATH="$REMOTE_ENV_FOUND"
     echo "  Found $REMOTE_ENV_PATH"
