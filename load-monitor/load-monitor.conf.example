@@ -58,13 +58,17 @@ DOMAIN_LOGS=/var/log/nginx/domains
 #
 # Block 5 then reads the combined log and reports client IPs, status codes and
 # user agents, but not domains: the default log_format has no $host, and adding
-# one means editing the web server config.
+# one means editing the web server config. List more than one file in
+# ACCESS_LOGS and block 5 counts per log file instead, which on a Forge box is
+# usually per site: one vhost with its own access_log, the rest inheriting the
+# global one or logging nothing at all.
 # Block 6 is skipped and block 7 takes over: the requests in flight, counted per
 # pool from the php-fpm unix sockets.
 # ---------------------------------------------------------------------------
 
 # Combined access log(s), space separated, globs allowed. Only read when
-# DOMAIN_LOGS is empty or missing.
+# DOMAIN_LOGS is empty or missing. With two or more files, block 5 also breaks
+# the requests down per log file, labelled with its basename.
 ACCESS_LOGS=""
 # How many lines to look back in each. Everything older than two minutes is
 # thrown away anyway; this only has to be more than two busy minutes' worth.

@@ -35,8 +35,9 @@
 #   DirectAdmin + nginx_apache   per-domain access logs (DOMAIN_LOGS), a MySQL
 #                                password file (MYSQL_CONF), and Apache's
 #                                scoreboard for requests in flight (STATUS_URL)
-#   Laravel Forge, nginx only    one combined access log (ACCESS_LOGS), MySQL
-#                                root over socket auth, no Apache. Leave
+#   Laravel Forge, nginx only    one or more combined access logs (ACCESS_LOGS,
+#                                counted per log file when there are several),
+#                                MySQL root over socket auth, no Apache. Leave
 #                                STATUS_URL empty; requests in flight are then
 #                                counted from the php-fpm unix sockets instead
 #
@@ -202,27 +203,36 @@ snapshot() {
     dmesg -T 2>/dev/null | grep -iE "out of memory|oom-killer|killed process" | tail -5
     echo "(empty = none)"; echo
 
-    local m1 m0 tmp n per_domain=0
+    local m1 m0 tmp n per_domain=0 per_logfile=0 nlogs=0
     m1=$(date +%d/%b/%Y:%H:%M); m0=$(date -d '-1 min' +%d/%b/%Y:%H:%M)
     tmp=$(mktemp)
     if [ -n "$DOMAIN_LOGS" ] && [ -d "$DOMAIN_LOGS" ]; then
         per_domain=1
         echo "5. WEB TRAFFIC, LAST 2 MINUTES (only logs written to in that window)"; echo "--------------------------------"
         find "$DOMAIN_LOGS" -name "*.log" ! -name "*.error.log" -mmin -2 2>/dev/null | head -40 | while read -r f; do
-            tail -n 500 "$f" | grep -F -e "[$m1" -e "[$m0" \
+            tail -n 500 "$f" | grep -aF -e "[$m1" -e "[$m0" \
                 | awk -v d="$(basename "$f" .log)" -F'"' '{split($1,a," "); print d "\t" a[1] "\t" $3 "\t" $6}'
         done > "$tmp"
     else
-        # One combined log for every site. The vhost is not in the default nginx
-        # log_format, so the per-domain breakdown is simply not available here;
-        # adding $host to log_format would mean touching the web server config.
-        echo "5. WEB TRAFFIC, LAST 2 MINUTES (combined access log, last $ACCESS_LOG_TAIL lines)"; echo "--------------------------------"
+        # One combined log per site at best. The vhost is not in the default nginx
+        # log_format, so a breakdown per domain within one log is simply not
+        # available here; adding $host would mean touching the web server config.
+        # ACCESS_LOGS may list several files, and then each line is labelled with
+        # the name of the log it came from, which is as close to a per-site split
+        # as a Forge box gets without editing nginx.
+        echo "5. WEB TRAFFIC, LAST 2 MINUTES (combined access logs, last $ACCESS_LOG_TAIL lines each)"; echo "--------------------------------"
         # shellcheck disable=SC2086
         for f in $ACCESS_LOGS; do
             [ -r "$f" ] || continue
-            tail -n "$ACCESS_LOG_TAIL" "$f" | grep -F -e "[$m1" -e "[$m0" \
-                | awk -F'"' '{split($1,a," "); print "-\t" a[1] "\t" $3 "\t" $6}'
+            nlogs=$((nlogs + 1))
+            # -a, because access logs are not reliably text: a bot sending a raw
+            # binary request puts NUL bytes in the log, and without it grep says
+            # "binary file matches" and prints nothing, so the whole block reads
+            # as zero requests during exactly the minutes that matter.
+            tail -n "$ACCESS_LOG_TAIL" "$f" | grep -aF -e "[$m1" -e "[$m0" \
+                | awk -v d="$(basename "$f" .log)" -F'"' '{split($1,a," "); print d "\t" a[1] "\t" $3 "\t" $6}'
         done > "$tmp"
+        [ "$nlogs" -gt 1 ] && per_logfile=1
     fi
     n=$(wc -l < "$tmp"); echo "requests: $n"
     if [ "$n" -gt 0 ]; then
@@ -230,6 +240,11 @@ snapshot() {
         SELF_RE="^($(echo "$SELF_IPS" | sed 's/ /|/g; s/\./\\./g'))$"; export SELF_RE
         if [ "$per_domain" = 1 ]; then
             echo "   domains:";  awk -F'\t' '{c[$1]++} END{for(k in c) printf "%6d  %s\n", c[k], k}' "$tmp" | sort -rn | head -5
+        elif [ "$per_logfile" = 1 ]; then
+            # not domains: one of these logs can hold several vhosts, and a vhost
+            # with access_log off appears in none of them.
+            echo "   access logs (combined log_format has no \$host, so this is per log file, not per domain):"
+            awk -F'\t' '{c[$1]++} END{for(k in c) printf "%6d  %s\n", c[k], k}' "$tmp" | sort -rn | head -5
         else
             echo "   domains: not logged (combined log_format has no \$host)"
         fi

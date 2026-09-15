@@ -57,6 +57,26 @@ still reports client IPs, status codes and user agents, but the domain
 breakdown is gone: nginx's default `combined` format has no `$host`, and
 putting one there means editing the web server config of a live machine.
 
+`ACCESS_LOGS` takes more than one file, space separated, and then block 5
+labels every request with the log it came from and counts per log file. That
+is as close to a per-site split as a Forge box gets without touching nginx.
+Sites there rarely share one log neatly: Forge's template writes
+`access_log off;` in the server block, and whoever needed a log for one site
+added an `access_log` line to that vhost alone. On the leguesswho box, for
+instance, `leguesswho.com` writes its own file, eight other vhosts log nothing
+at all, and only the catch-all still lands in the global `access.log`:
+
+```sh
+ACCESS_LOGS="/var/log/nginx/access.log /var/log/nginx/leguesswho.com-access.log"
+```
+
+Before trusting that list, check which vhosts actually log. Do not grep for
+`access_log off` in a vhost file: every Forge template carries
+`location = /favicon.ico { access_log off; ... }`, so that matches everywhere
+and makes it look as if no site logs. Look for an `access_log` line at server
+level, outside any `location` block. For a site that logs nothing, its
+`*-error.log` is the only trace left.
+
 Block 6 is skipped and **block 7** answers the same question in its place: for
 every php-fpm pool, how many established connections its unix socket has right
 now, which is how many requests that pool is executing at this instant. It does
