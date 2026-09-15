@@ -6,5 +6,10 @@
 #
 # Leave MAILTO pointing somewhere a human reads: the mail is the alert, the file
 # on disk is the record that survives inbox cleanups.
+#
+# On a box that cannot actually deliver mail, set MAILTO="" instead. Cron then
+# drops the output rather than piling every snapshot into /var/mail/root, and the
+# snapshots in /var/log/load-snapshots are the whole record. Make sure something
+# else tells you a spike happened: Forge Monitor, an uptime check, anything.
 MAILTO=root
 * * * * * root /usr/local/sbin/load-monitor

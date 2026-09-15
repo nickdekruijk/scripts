@@ -17,10 +17,10 @@
 #   - prints a snapshot to stdout (cron mails it) and writes the same text to
 #     SNAPSHOT_DIR/YYYY-MM-DD_HHMMSS.txt, kept RETENTION_DAYS days
 #   - the snapshot contains: top, connections per IP, D-state processes, the
-#     MySQL processlist, memory per account and per process, php-fpm workers
-#     per pool, vmstat (swap in/out), OOM-killer messages, web traffic of the
-#     last two minutes per domain and IP, and the Apache scoreboard (requests
-#     in flight, with how long each has been running)
+#     MySQL processlist, memory per account and per process, who sits in swap,
+#     php-fpm workers per pool, vmstat (swap in/out), OOM-killer messages, web
+#     traffic of the last two minutes, and the requests that are in flight
+#     right now
 #
 # What it deliberately does not do: restart anything. The script it replaced
 # restarted nginx and httpd at load >= 6. That cost about a minute of CPU on
@@ -30,15 +30,23 @@
 #
 # Configuration lives in CONF (default /etc/load-monitor.conf), see
 # load-monitor.conf.example. Everything server specific goes there, so this
-# file is the same on every machine.
+# file is the same on every machine. It runs on two kinds of box:
+#
+#   DirectAdmin + nginx_apache   per-domain access logs (DOMAIN_LOGS), a MySQL
+#                                password file (MYSQL_CONF), and Apache's
+#                                scoreboard for requests in flight (STATUS_URL)
+#   Laravel Forge, nginx only    one combined access log (ACCESS_LOGS), MySQL
+#                                root over socket auth, no Apache. Leave
+#                                STATUS_URL empty; requests in flight are then
+#                                counted from the php-fpm unix sockets instead
 #
 # Usage:
 #   load-monitor            normal run (this is what cron calls, every minute)
 #   load-monitor debug      force a snapshot at any load, useful for testing
 #   load-monitor --help
 #
-# Requires bash, flock, ss, vmstat, curl and top. mysql for the processlist.
-# Linux only (GNU date, /proc).
+# Requires bash, flock, ss, vmstat and top. curl for Apache's server-status,
+# mysql for the processlist. Linux only (GNU date, /proc).
 
 set -u
 export LC_ALL=C   # never let a locale turn 0.27 into 0,27 in the log
@@ -67,9 +75,21 @@ STATUS_PW=""
 STATUS_PW_FILE=/etc/httpd/conf/extra/httpd-info.conf.secret
 MYSQL_CONF=/usr/local/directadmin/conf/mysql.conf
 DOMAIN_LOGS=/var/log/nginx/domains
+# Fallback for boxes without per-domain logs: one or more combined access logs,
+# space separated, globs allowed. Only used when DOMAIN_LOGS is empty or gone.
+ACCESS_LOGS=""
+ACCESS_LOG_TAIL=20000
+# php-fpm master logs, space separated, globs allowed. Used to show the last
+# "max_children reached" warnings next to the live worker counts.
+FPM_LOGS=""
+# Which unix sockets count as php-fpm in the requests-in-flight block. Covers both
+# spellings seen in the wild: /run/php/php8.3-fpm-site.sock on Debian and Forge,
+# /usr/local/php81/sockets/site.sock on DirectAdmin.
+FPM_SOCKET_RE="fpm|/sockets/"
 
 case "${1:-}" in
-    -h|--help) sed -n '3,43p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    # print the header comment, however long it is, without tracking line numbers
+    -h|--help) awk 'NR>=3 && /^#/ {sub(/^# ?/,""); print; next} NR>=3 {exit}' "$0"; exit 0 ;;
 esac
 DEBUG=0; [ "${1:-}" = "debug" ] && DEBUG=1
 
@@ -114,28 +134,64 @@ snapshot() {
     echo "(empty = none)"; echo
 
     echo "MYSQL PROCESSLIST (non-sleeping)"; echo "================================"
-    if [ -r "$MYSQL_CONF" ] && command -v mysql >/dev/null 2>&1; then
-        # credentials through a temp defaults file, never on the command line
-        local cnf; cnf=$(mktemp) && chmod 600 "$cnf"
-        awk -F= '/^(user|passwd|password)=/{k=$1; sub(/^passwd$/,"password",k); print k"="$2}' "$MYSQL_CONF" \
-            | sed '1i [client]' > "$cnf"
-        mysql --defaults-extra-file="$cnf" -e 'SHOW FULL PROCESSLIST' 2>&1 \
-            | awk -F'\t' 'NR==1 || $5 != "Sleep"' | cut -c1-220
-        echo "sleeping connections: $(mysql --defaults-extra-file="$cnf" -N -e 'SHOW PROCESSLIST' 2>/dev/null | awk -F'\t' '$5=="Sleep"' | wc -l)"
-        rm -f "$cnf"
-    else
-        echo "skipped: $MYSQL_CONF not readable or mysql client missing"
+    # Two ways in. DirectAdmin keeps a password file (MYSQL_CONF); its contents go
+    # through a temp defaults file so they never appear on a command line. On a
+    # Forge box there is no such file, but root reaches MySQL over socket auth, so
+    # a bare "mysql" works. Try the file first, then the socket, then give up.
+    local cnf="" mysql_ok=0
+    if command -v mysql >/dev/null 2>&1; then
+        if [ -r "$MYSQL_CONF" ]; then
+            cnf=$(mktemp) && chmod 600 "$cnf"
+            awk -F= '/^(user|passwd|password)=/{k=$1; sub(/^passwd$/,"password",k); print k"="$2}' "$MYSQL_CONF" \
+                | sed '1i [client]' > "$cnf"
+            mysql_ok=1
+        elif mysql -N -e 'SELECT 1' >/dev/null 2>&1; then
+            mysql_ok=1
+        fi
     fi
+    if [ "$mysql_ok" = 1 ]; then
+        local -a my=(mysql)
+        [ -n "$cnf" ] && my+=("--defaults-extra-file=$cnf")
+        "${my[@]}" -e 'SHOW FULL PROCESSLIST' 2>&1 \
+            | awk -F'\t' 'NR==1 || $5 != "Sleep"' | cut -c1-220
+        echo "sleeping connections: $("${my[@]}" -N -e 'SHOW PROCESSLIST' 2>/dev/null | awk -F'\t' '$5=="Sleep"' | wc -l)"
+    elif ! command -v mysql >/dev/null 2>&1; then
+        echo "skipped: no mysql client"
+    else
+        echo "skipped: $MYSQL_CONF not readable and socket auth refused"
+    fi
+    [ -n "$cnf" ] && rm -f "$cnf"
     echo
 
     echo "1. MEMORY PER ACCOUNT (RSS in MB, top 10)"; echo "--------------------------------"
     ps -eo user:20,rss --no-headers | awk '{s[$1]+=$2} END{for(u in s) printf "%7d MB  %s\n", s[u]/1024, u}' | sort -rn | head -10
     echo "   per process name (RSS; shared memory counted once per process, so nginx with ModSecurity looks inflated)"
     ps -eo rss,comm --no-headers | awk '{s[$2]+=$1} END{for(c in s) printf "%7d MB  %s\n", s[c]/1024, c}' | sort -rn | head -8
+    echo "   in swap, per process name (a full swapfile with nothing paging in is slow, not an emergency)"
+    awk '/^SwapTotal:/{t=$2} /^SwapFree:/{f=$2} END{printf "%7d MB  used of %d MB total\n", (t-f)/1024, t/1024}' /proc/meminfo
+    # a process can exit between the glob and the read, hence the discarded errors
+    awk '/^Name:/{n=$2} /^VmSwap:/{s[n]+=$2}
+         END{for(k in s) if(s[k]>0) printf "%7d MB  %s\n", s[k]/1024, k}' /proc/[0-9]*/status 2>/dev/null \
+        | sort -rn | head -5
     echo
 
     echo "2. PHP-FPM WORKERS PER POOL (top 12)"; echo "--------------------------------"
-    ps -eo user:20,comm --no-headers | awk '$2 ~ /^php-fpm/ {c[$1" "$2]++} END{for(k in c) printf "%4d  %s\n", c[k], k}' | sort -rn | head -12
+    # Three things matter and they live in two places: the pool name is only in the
+    # process title ("php-fpm: pool mediawise"), while the PHP version is only in
+    # comm (php-fpm81, php-fpm8.3). Take both, so one line says which site, which
+    # account and which interpreter.
+    printf '%s\n' "      n  pool                 account          version"
+    ps -eo user:20,comm:16,args --no-headers \
+        | awk '$3=="php-fpm:" && $4=="pool" {c[$5"\t"$1"\t"$2]++}
+               END{for(k in c){split(k,f,"\t"); printf "%7d  %-20s %-16s %s\n", c[k], f[1], f[2], f[3]}}' \
+        | sort -rn | head -12
+    ps -eo comm:16,args --no-headers \
+        | awk '$2=="php-fpm:" && $3=="master" {gsub(/[()]/,"",$5); printf "%7s  %-20s %-16s %s %s\n", "", "(master)", "", $1, $5}' | sort
+    if [ -n "$FPM_LOGS" ]; then
+        echo "   last max_children warnings (own timestamps, not necessarily this spike):"
+        # shellcheck disable=SC2086
+        grep -hs max_children $FPM_LOGS | tail -3 | sed 's/^/      /'
+    fi
     echo
 
     echo "3. VMSTAT (si/so = swap in/out per second, r = run queue, wa = iowait)"; echo "--------------------------------"
@@ -146,19 +202,37 @@ snapshot() {
     dmesg -T 2>/dev/null | grep -iE "out of memory|oom-killer|killed process" | tail -5
     echo "(empty = none)"; echo
 
-    echo "5. WEB TRAFFIC, LAST 2 MINUTES (only logs written to in that window)"; echo "--------------------------------"
-    local m1 m0 tmp n self_re
+    local m1 m0 tmp n per_domain=0
     m1=$(date +%d/%b/%Y:%H:%M); m0=$(date -d '-1 min' +%d/%b/%Y:%H:%M)
     tmp=$(mktemp)
-    find "$DOMAIN_LOGS" -name "*.log" ! -name "*.error.log" -mmin -2 2>/dev/null | head -40 | while read -r f; do
-        tail -n 500 "$f" | grep -F -e "[$m1" -e "[$m0" \
-            | awk -v d="$(basename "$f" .log)" -F'"' '{split($1,a," "); print d "\t" a[1] "\t" $3 "\t" $6}'
-    done > "$tmp"
+    if [ -n "$DOMAIN_LOGS" ] && [ -d "$DOMAIN_LOGS" ]; then
+        per_domain=1
+        echo "5. WEB TRAFFIC, LAST 2 MINUTES (only logs written to in that window)"; echo "--------------------------------"
+        find "$DOMAIN_LOGS" -name "*.log" ! -name "*.error.log" -mmin -2 2>/dev/null | head -40 | while read -r f; do
+            tail -n 500 "$f" | grep -F -e "[$m1" -e "[$m0" \
+                | awk -v d="$(basename "$f" .log)" -F'"' '{split($1,a," "); print d "\t" a[1] "\t" $3 "\t" $6}'
+        done > "$tmp"
+    else
+        # One combined log for every site. The vhost is not in the default nginx
+        # log_format, so the per-domain breakdown is simply not available here;
+        # adding $host to log_format would mean touching the web server config.
+        echo "5. WEB TRAFFIC, LAST 2 MINUTES (combined access log, last $ACCESS_LOG_TAIL lines)"; echo "--------------------------------"
+        # shellcheck disable=SC2086
+        for f in $ACCESS_LOGS; do
+            [ -r "$f" ] || continue
+            tail -n "$ACCESS_LOG_TAIL" "$f" | grep -F -e "[$m1" -e "[$m0" \
+                | awk -F'"' '{split($1,a," "); print "-\t" a[1] "\t" $3 "\t" $6}'
+        done > "$tmp"
+    fi
     n=$(wc -l < "$tmp"); echo "requests: $n"
     if [ "$n" -gt 0 ]; then
         # via ENVIRON, not -v: awk -v processes backslash escapes and warns on \.
         SELF_RE="^($(echo "$SELF_IPS" | sed 's/ /|/g; s/\./\\./g'))$"; export SELF_RE
-        echo "   domains:";      awk -F'\t' '{c[$1]++} END{for(k in c) printf "%6d  %s\n", c[k], k}' "$tmp" | sort -rn | head -5
+        if [ "$per_domain" = 1 ]; then
+            echo "   domains:";  awk -F'\t' '{c[$1]++} END{for(k in c) printf "%6d  %s\n", c[k], k}' "$tmp" | sort -rn | head -5
+        else
+            echo "   domains: not logged (combined log_format has no \$host)"
+        fi
         echo "   client IPs (own IPs excluded):"; awk -F'\t' '$2 !~ ENVIRON["SELF_RE"] {c[$2]++} END{for(k in c) printf "%6d  %s\n", c[k], k}' "$tmp" | sort -rn | head -5
         echo "   status codes:"; awk -F'\t' '{split($3,s," "); c[s[1]]++} END{for(k in c) printf "%6d  %s\n", c[k], k}' "$tmp" | sort -rn | head -5
         echo "   user agents:";  awk -F'\t' '{c[$4]++} END{for(k in c) printf "%6d  %.90s\n", c[k], k}' "$tmp" | sort -rn | head -3
@@ -172,13 +246,15 @@ snapshot() {
     # the first one that returns the real page wins. <Location /server-status>
     # is global in httpd-info.conf, so any sane vhost serves it.
     local body code host ok=0 pw="$STATUS_PW"
-    if [ -z "$pw" ] && [ -r "$STATUS_PW_FILE" ]; then
+    if [ -n "$STATUS_URL" ] && [ -z "$pw" ] && [ -r "$STATUS_PW_FILE" ]; then
         pw=$(sed -nE 's/^#?[[:space:]]*[Pp]assword:[[:space:]]*([^[:space:]]+).*/\1/p' "$STATUS_PW_FILE" | head -1)
         u=$(sed -nE 's/^#?[[:space:]]*[Uu]sername:[[:space:]]*([^[:space:]]+).*/\1/p' "$STATUS_PW_FILE" | head -1)
         [ -n "$u" ] && STATUS_USER=$u
     fi
     body=$(mktemp)
-    if [ -z "$pw" ] || [ -z "$STATUS_HOSTS" ]; then
+    if [ -z "$STATUS_URL" ]; then
+        echo "   skipped: STATUS_URL empty, no Apache on this box (see block 7 instead)"
+    elif [ -z "$pw" ] || [ -z "$STATUS_HOSTS" ]; then
         echo "   skipped: no password (STATUS_PW or readable STATUS_PW_FILE) or no STATUS_HOSTS in $CONF"
     else
         for host in $STATUS_HOSTS; do
@@ -203,13 +279,33 @@ snapshot() {
     fi
     rm -f "$body"; echo
 
+    echo "7. PHP-FPM REQUESTS IN FLIGHT (established unix sockets, per pool)"; echo "--------------------------------"
+    # Without Apache there is no scoreboard, but every request nginx has handed to
+    # php-fpm is an established connection on that pool's socket, so counting them
+    # gives the same "how many are running right now, and where" per pool. It does
+    # not give the URL; that would need pm.status_path on every pool.
+    # Only the local-address column carries the path: the nginx side of the same
+    # connection lists it as its peer, so filtering the whole line counts twice.
+    local fpm_n
+    fpm_n=$(ss -xH state established 2>/dev/null | awk -v re="$FPM_SOCKET_RE" '$4 ~ re' | wc -l)
+    echo "   total: $fpm_n"
+    ss -xH state established 2>/dev/null | awk -v re="$FPM_SOCKET_RE" '$4 ~ re {print $4}' \
+        | sort | uniq -c | sort -rn | head -15 | sed 's/^/   /'
+    echo "(empty = no request was being executed at this instant)"; echo
+
     echo "LISTENING SOCKETS"; echo "================================"
     ss -Hltnp 2>/dev/null | awk '{print $4, $6}' | sed 's/users:(("//; s/",.*//' | sort -u | head -30
 }
 
 mkdir -p "$SNAPSHOT_DIR" && chmod 700 "$SNAPSHOT_DIR"
 out="$SNAPSHOT_DIR/$(date +%Y-%m-%d_%H%M%S).txt"
-snapshot 2>&1 | tee "$out"
+# Write the file first and only then echo it, rather than "snapshot | tee $out".
+# With tee, anything that stops reading stdout halfway kills tee on the spot and
+# leaves a truncated snapshot behind: run it over ssh through "head" once and the
+# record on disk ends mid-block. The file is the thing worth protecting here.
+umask 077
+snapshot > "$out" 2>&1
 chmod 600 "$out" 2>/dev/null
+cat "$out"
 find "$SNAPSHOT_DIR" -maxdepth 1 -name '*.txt' -mtime +"$RETENTION_DAYS" -delete 2>/dev/null
 exit 0

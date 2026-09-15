@@ -36,8 +36,47 @@ STATUS_USER=info
 STATUS_PW_FILE=/etc/httpd/conf/extra/httpd-info.conf.secret
 STATUS_PW=""
 
-# DirectAdmin's MySQL credentials file (user=..., passwd=...).
+# DirectAdmin's MySQL credentials file (user=..., passwd=...). Leave empty on a
+# box where root reaches MySQL over socket auth (a plain "mysql" as root works);
+# the script falls back to that by itself.
 MYSQL_CONF=/usr/local/directadmin/conf/mysql.conf
 
 # Per-domain nginx access logs, used for the "last 2 minutes" traffic block.
 DOMAIN_LOGS=/var/log/nginx/domains
+
+# ---------------------------------------------------------------------------
+# nginx-only boxes (Laravel Forge and the like)
+#
+# No Apache, no per-domain logs, no DirectAdmin. Set it up like this instead:
+#
+#   STATUS_URL=""                            # skips the server-status block
+#   STATUS_HOSTS=""
+#   MYSQL_CONF=""                            # root over socket auth
+#   DOMAIN_LOGS=""                           # no per-domain logs
+#   ACCESS_LOGS="/var/log/nginx/access.log"
+#   FPM_LOGS="/var/log/php*-fpm.log"
+#
+# Block 5 then reads the combined log and reports client IPs, status codes and
+# user agents, but not domains: the default log_format has no $host, and adding
+# one means editing the web server config.
+# Block 6 is skipped and block 7 takes over: the requests in flight, counted per
+# pool from the php-fpm unix sockets.
+# ---------------------------------------------------------------------------
+
+# Combined access log(s), space separated, globs allowed. Only read when
+# DOMAIN_LOGS is empty or missing.
+ACCESS_LOGS=""
+# How many lines to look back in each. Everything older than two minutes is
+# thrown away anyway; this only has to be more than two busy minutes' worth.
+ACCESS_LOG_TAIL=20000
+
+# php-fpm master logs, space separated, globs allowed. When set, block 2 shows
+# the last few "max_children reached" warnings under the live worker counts.
+# DirectAdmin: /usr/local/php*/var/log/php-fpm.log. Forge: /var/log/php*-fpm.log.
+FPM_LOGS=""
+
+# Which unix sockets count as php-fpm in block 7. The default matches both
+# spellings in use: /run/php/php8.3-fpm-site.sock on Forge and Debian, and
+# /usr/local/php81/sockets/site.sock on DirectAdmin, which has no "fpm" in the
+# path at all. Check with "ss -xH state established" if a box disagrees.
+FPM_SOCKET_RE="fpm|/sockets/"

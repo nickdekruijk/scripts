@@ -37,6 +37,38 @@ Test with `LC_ALL=C` if your shell is not already in that locale, the way
 cron runs it. The script sets it for itself, but the point is to see what
 cron will see.
 
+## nginx-only servers (Laravel Forge)
+
+The script was written on a DirectAdmin box and also runs on plain nginx ones.
+Everything DirectAdmin-specific is switched off from the config file, so the
+script itself stays identical on every machine:
+
+```sh
+STATUS_URL=""                            # no Apache, skips block 6
+STATUS_HOSTS=""
+MYSQL_CONF=""                            # root reaches MySQL over socket auth
+DOMAIN_LOGS=""                           # no per-domain access logs
+ACCESS_LOGS="/var/log/nginx/access.log"
+FPM_LOGS="/var/log/php*-fpm.log"
+```
+
+Two blocks behave differently as a result. Block 5 reads the combined log and
+still reports client IPs, status codes and user agents, but the domain
+breakdown is gone: nginx's default `combined` format has no `$host`, and
+putting one there means editing the web server config of a live machine.
+
+Block 6 is skipped and **block 7** answers the same question in its place: for
+every php-fpm pool, how many established connections its unix socket has right
+now, which is how many requests that pool is executing at this instant. It does
+not show which URL each one is; that needs `pm.status_path` on every pool plus
+an nginx location. Note that only the local-address column of `ss` carries the
+socket path, because the nginx end of the same connection lists it as its peer.
+Filtering the whole line counts every request twice.
+
+If the box cannot send mail, set `MAILTO=""` in the cron file. Otherwise every
+snapshot lands in `/var/mail/root` forever. The snapshots on disk are then the
+record, so make sure something else tells you a spike happened at all.
+
 ## What a snapshot contains
 
 The familiar part first: `top`, connections per IP, processes in D state and
@@ -44,11 +76,18 @@ the MySQL processlist (non-sleeping rows only, with a count of the sleeping
 ones). Then the six blocks that answer the questions which otherwise come up
 the morning after:
 
-1. **Memory per account and per process name.** Who holds the memory, in MB.
-   Note that RSS counts shared memory once per process, so nginx with a big
-   ModSecurity ruleset looks several times larger than it really is.
-2. **php-fpm workers per pool.** Which pool is full right now, without
-   waiting for the `max_children reached` line in the fpm log.
+1. **Memory per account and per process name, and who sits in swap.** Who holds
+   the memory, in MB. Note that RSS counts shared memory once per process, so
+   nginx with a big ModSecurity ruleset looks several times larger than it
+   really is. The swap list is `VmSwap` per process name plus the total: a full
+   swapfile with nothing paging in is slow, not an emergency, and `vmstat`
+   below says which of the two this is.
+2. **php-fpm workers per pool.** Which pool is full right now. The pool name
+   comes from the process title, the only place it appears; `comm` is just
+   `php-fpm8.3` and would merge every pool of one version into a single line.
+   With `FPM_LOGS` set, the last few `max_children reached` warnings are shown
+   underneath, with their own timestamps, so read them as history and not as
+   part of this spike.
 3. **`vmstat 1 3`.** Whether this is a swap storm (`si`/`so`), plus run queue
    and iowait on one line. `sar` only has ten-minute averages.
 4. **OOM killer.** The last five kernel messages, because a killed `mysqld`
@@ -60,7 +99,11 @@ the morning after:
    that tells you which day to open.
 6. **Apache server-status.** The requests in flight at that moment, with
    vhost, client and how many seconds each has been running. The only source
-   that shows a request before it is finished and logged.
+   that shows a request before it is finished and logged. Skipped when
+   `STATUS_URL` is empty.
+7. **php-fpm requests in flight.** The same question on a box without Apache:
+   established connections per pool socket, which is what each pool is
+   executing right now. No URLs, only counts.
 
 ## Two things about server-status
 
