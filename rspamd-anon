@@ -46,25 +46,65 @@ open(my $df, "<", $domain_file) or die "domains: $!";
 while (<$df>) { chomp; s/^\s+|\s+$//g; $own{lc $_} = 1 if length; }
 close $df;
 
+# Is het domein (of een bovenliggend domein) van ons?
+sub is_own {
+    my $probe = lc shift;
+    while ($probe =~ /\./) {
+        return 1 if $own{$probe};
+        $probe =~ s/^[^.]+\.//;
+    }
+    return 0;
+}
+
+# Hash zonder domein, zodat een los local part dezelfde naam krijgt als het
+# bijbehorende adres: "=> user-abc <user-abc@klant.nl>"
+sub hash_of {
+    my ($local, $domain) = @_;
+    return "user-" . substr(md5_hex($salt . lc($local) . lc($domain)), 0, 10);
+}
+
 sub anon {
     my ($local, $domain) = @_;
-    my $h = substr(md5_hex($salt . lc($local) . lc($domain)), 0, 10);
-    return "user-$h\@$domain";
+    return hash_of($local, $domain) . "\@$domain";
+}
+
+# VERP en SRS verstoppen een adres in het local part van een ander adres:
+# bounces+123-jan=klant.nl@esp.example of SRS0=ab=cd=klant.nl=jan@forwarder.example
+sub hides_own {
+    my $local = shift;
+    while ($local =~ /=([a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)+)/g) {
+        return 1 if is_own($1);
+    }
+    return 0;
 }
 
 while (my $line = <STDIN>) {
-    # Adres alleen maskeren als het domein (of het bovenliggende domein) van ons is
+    # Maildir-paden van subaccounts: /imap/klant.nl/jan/Maildir
+    $line =~ s{(/imap/([a-zA-Z0-9.-]+)/)([^/\s]+)(?=/)}{
+        is_own($2) ? $1 . hash_of($3, $2) : "$1$3"
+    }ge;
+
+    # Exim zet bij een aflevering het local part los voor het adres:
+    # "=> jan <jan@klant.nl>". Bij een forward staat daar het doeladres:
+    # "=> jan@gmail.com <jan@klant.nl>", ook dat is van de klant. Paden en
+    # pipes laten we staan.
+    $line =~ s{((?:=>|->|\*>|\*\*|==)\s+)([^\s<@/|][^\s<]*)(\s+<[^\s<>@]+\@([^\s<>]+)>)}{
+        my ($pre, $tok, $post, $d) = ($1, $2, $3, $4);
+          !is_own($d)                                ? "$pre$tok$post"
+        : $tok !~ /\@/                               ? $pre . hash_of($tok, $d) . $post
+        : $tok =~ /^([^@]+)\@([^@]+)$/ && !is_own($2) ? $pre . "fwd-" . substr(md5_hex($salt . lc $tok), 0, 10) . "\@$2" . $post
+        :                                              "$pre$tok$post";
+    }ge;
+
+    # Adres maskeren als het domein van ons is, of als het local part via
+    # VERP of SRS een adres op ons domein bevat
     $line =~ s{
         ([a-zA-Z0-9._%+=-]+) @ ([a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)+)
     }{
         my ($l, $d) = ($1, $2);
-        my $match = 0;
-        my $probe = lc $d;
-        while ($probe =~ /\./) {
-            if ($own{$probe}) { $match = 1; last }
-            $probe =~ s/^[^.]+\.//;
-        }
-        $match ? anon($l, $d) : "$l\@$d";
+          is_own($d)    ? anon($l, $d)
+        : hides_own($l) ? "verp-" . substr(md5_hex($salt . lc $l), 0, 10) . "\@$d"
+        :                 "$l\@$d";
     }gex;
 
     print $line;
