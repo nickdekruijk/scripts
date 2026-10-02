@@ -1,15 +1,33 @@
 #!/bin/bash
 #
-# rspamd-anon - maskeert e-mailadressen van eigen domeinen in rspamd/exim logs
+# rspamd-anon - maskeert e-mailadressen van eigen domeinen in mail-logs
 #
 # Gebruik:
 #   tail -n1000 /var/log/rspamd/rspamd.log | rspamd-anon
 #   rspamd-anon < bericht.eml
 #   grep "iets" /var/log/exim/mainlog | rspamd-anon
+#   journalctl -u dovecot | rspamd-anon
 #
 # Adressen op eigen domeinen worden vervangen door een stabiele hash,
 # zodat hetzelfde adres herkenbaar blijft als hetzelfde. Externe domeinen
 # (spammers, mailinglijsten) blijven onaangetast zodat patronen zichtbaar zijn.
+#
+# Loginnamen zonder @ (DirectAdmin-gebruikers, of een naam die per ongeluk in
+# het veld voor de gebruikersnaam staat) krijgen ook een hash: in Dovecot-logs
+# als user=<...>, proxy(...), passwd-file(...) enzovoort, en in Roundcube als
+# "login for ...". Zo werkt het ook op een Dovecot-proxy voor DirectAdmin.
+#
+# IP-adressen van gebruikers worden gemaskeerd waar ze bij een login horen:
+# rip= en auth-regels in Dovecot, "from" in Roundcube, en Exim-regels met A= of
+# "authenticator failed". De eerste twee blokken blijven leesbaar (provider,
+# reeks), de rest wordt een hash: 192.0.x.x-1a2b3c. Afzenders van inkomende mail
+# (rspamd ip:, Exim H= zonder login) blijven staan: dat zijn mailservers.
+# Nooit gemaskeerd: loopback, privé-reeksen en de IP's in /etc/virtual/proxy_hosts_ip.
+#
+#   rspamd-anon --keep-ip    IP-adressen niet maskeren
+
+KEEP_IP=0
+[ "${1:-}" = "--keep-ip" ] && KEEP_IP=1
 
 SALT_FILE="/etc/rspamd-anon.salt"
 
@@ -25,7 +43,15 @@ trap 'rm -f "$DOMAINS"' EXIT
 
 if [ -f /etc/virtual/domains ]; then
     grep -v '^\s*$' /etc/virtual/domains > "$DOMAINS"
-else
+fi
+
+# Op een Dovecot-proxy staan de domeinen van elke backend als mappen onder
+# /etc/virtual-sync/<server>/domains/
+for d in /etc/virtual-sync/*/domains; do
+    [ -d "$d" ] && find "$d" -maxdepth 1 -mindepth 1 -type d -printf '%f\n' >> "$DOMAINS"
+done
+
+if [ ! -s "$DOMAINS" ] && [ -d /etc/virtual ]; then
     # Fallback: mapnamen onder /etc/virtual zijn de domeinen
     find /etc/virtual -maxdepth 1 -mindepth 1 -type d -printf '%f\n' > "$DOMAINS"
 fi
@@ -36,9 +62,31 @@ use Digest::MD5 qw(md5_hex);
 
 my $salt_file   = shift;
 my $domain_file = shift;
+my $keep_ip     = shift;
 
 open(my $sf, "<", $salt_file) or die "salt: $!";
 my $salt = <$sf>; chomp $salt; close $sf;
+
+# Eigen proxyadressen (DirectAdmin) worden nooit gemaskeerd
+my %keep;
+if (open(my $kf, "<", "/etc/virtual/proxy_hosts_ip")) {
+    while (<$kf>) { s/\s+//g; $keep{$_} = 1 if length; }
+    close $kf;
+}
+
+my $ipv4 = qr/(?:\d{1,3}\.){3}\d{1,3}/;
+my $ipv6 = qr/[0-9a-fA-F]{0,4}(?::[0-9a-fA-F]{0,4}){2,7}/;
+
+sub mask_ip {
+    my $ip = shift;
+    return $ip if $keep_ip || $keep{$ip};
+    return $ip if $ip =~ /^(?:127\.|10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.)/;
+    return $ip if $ip =~ /^(?:::1|fe80:|f[cd][0-9a-f]{2}:)/i || $ip !~ /\d/;
+    my $h = substr(md5_hex($salt . lc $ip), 0, 6);
+    if ($ip =~ /^(\d+\.\d+)\./) { return "$1.x.x-$h"; }
+    if ($ip =~ /^([0-9a-fA-F]{1,4}:[0-9a-fA-F]{1,4}):/) { return "$1::x-$h"; }
+    return "ip-$h";
+}
 
 # Eigen domeinen inlezen
 my %own;
@@ -78,7 +126,47 @@ sub hides_own {
     return 0;
 }
 
+# Een loginnaam zonder @ maskeren; met @ laten we over aan de adresregel verderop,
+# die eigen en externe domeinen uit elkaar houdt. Leeg, "?" en al gemaskeerd: laten staan.
+sub mask_login {
+    my $name = shift;
+    return $name if $name eq "" || $name eq "?" || $name =~ /\@/;
+    return $name if $name =~ /^(?:user|verp|fwd)-[0-9a-f]{10}$/;
+    return hash_of($name, "");
+}
+
 while (my $line = <STDIN>) {
+    # Dovecot: user=<jan>, proxy(jan,1.2.3.4:143), passwd-file(jan,1.2.3.4,<id>),
+    # imap(jan)<pid>, en "(username: Jan Jansen)" bij een geweigerde naam
+    $line =~ s{(user=<)([^>]*)(>)}{$1 . mask_login($2) . $3}ge;
+    # auth-worker(16763) zonder komma is een procesnummer, geen naam
+    $line =~ s{\b((?:imap|pop3|lmtp|managesieve|submission|sieve|proxy|passwd-file|shadow|pam|plain|login|checkpassword|auth-worker)\()([^,()<>]*)(?=[,)])}{
+        my ($p, $n) = ($1, $2);
+        ($p eq "auth-worker(" && $n =~ /^\d+$/) ? "$p$n" : $p . mask_login($n);
+    }ge;
+    $line =~ s{(\(username: )([^)]*)(\))}{$1 . mask_login($2) . $3}ge;
+
+    # Roundcube userlogins.log: "Successful login for jan (ID: 3) from 1.2.3.4"
+    $line =~ s{(\blogin for )(\S+)}{$1 . mask_login($2)}ge;
+
+    # IP-adressen van gebruikers. Dovecot: rip=1.2.3.4, en het IP in
+    # passwd-file(jan,1.2.3.4,<id>) of plain(?,1.2.3.4,<id>). proxy(jan,ip:poort)
+    # is de backend, lip= de eigen server: die blijven staan.
+    $line =~ s{(\brip=)($ipv4|$ipv6)(?=[,\s]|$)}{$1 . mask_ip($2)}ge;
+    $line =~ s{(\([^,()<>]*,)($ipv4|$ipv6)(?=,<|\))}{$1 . mask_ip($2)}ge;
+    # Roundcube: "... login for jan (ID: 3) from 1.2.3.4"
+    $line =~ s{(\blogin for \S+.*? from )($ipv4|$ipv6)}{$1 . mask_ip($2)}ge;
+    # Exim: alleen bij een login. I=[...] is de eigen interface.
+    if ($line =~ / A=\S+| authenticator failed/) {
+        $line =~ s{(?<!I=)\[($ipv4|$ipv6)\]}{"[" . mask_ip($1) . "]"}ge;
+    }
+
+    # Exim: geauthenticeerd versturen als A=plain:jan, mislukt als (set_id=jan)
+    $line =~ s{(\bA=[a-z_]+:)([^\s\@]+)(?=\s)}{$1 . mask_login($2)}ge;
+    # Alleen als er geen @ volgt: set_id=jan@klant.nl laten we aan de adresregel,
+    # zodat die dezelfde hash krijgt als in eerdere versies
+    $line =~ s{(\bset_id=)([^)\s\@]+)(?=[)\s])}{$1 . mask_login($2)}ge;
+
     # Maildir-paden van subaccounts: /imap/klant.nl/jan/Maildir
     $line =~ s{(/imap/([a-zA-Z0-9.-]+)/)([^/\s]+)(?=/)}{
         is_own($2) ? $1 . hash_of($3, $2) : "$1$3"
@@ -109,4 +197,4 @@ while (my $line = <STDIN>) {
 
     print $line;
 }
-' "$SALT_FILE" "$DOMAINS"
+' "$SALT_FILE" "$DOMAINS" "$KEEP_IP"
