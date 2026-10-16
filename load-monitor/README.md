@@ -62,12 +62,12 @@ labels every request with the log it came from and counts per log file. That
 is as close to a per-site split as a Forge box gets without touching nginx.
 Sites there rarely share one log neatly: Forge's template writes
 `access_log off;` in the server block, and whoever needed a log for one site
-added an `access_log` line to that vhost alone. On the leguesswho box, for
-instance, `leguesswho.com` writes its own file, eight other vhosts log nothing
-at all, and only the catch-all still lands in the global `access.log`:
+added an `access_log` line to that vhost alone. On one such box, for
+instance, `shop.example.com` writes its own file, eight other vhosts log
+nothing at all, and only the catch-all still lands in the global `access.log`:
 
 ```sh
-ACCESS_LOGS="/var/log/nginx/access.log /var/log/nginx/leguesswho.com-access.log"
+ACCESS_LOGS="/var/log/nginx/access.log /var/log/nginx/shop.example.com-access.log"
 ```
 
 Before trusting that list, check which vhosts actually log. Do not grep for
@@ -88,6 +88,52 @@ Filtering the whole line counts every request twice.
 If the box cannot send mail, set `MAILTO=""` in the cron file. Otherwise every
 snapshot lands in `/var/mail/root` forever. The snapshots on disk are then the
 record, so make sure something else tells you a spike happened at all.
+
+## Health check
+
+Off by default; `HEALTH_CHECK=1` switches it on. Load says nothing about a web
+server that has stopped answering: Apache on a DirectAdmin box once sat for four
+and a half hours with every scoreboard slot taken by HTTP/2 streams that bots
+had opened and abandoned, at a load of 0.05. So every run asks each running
+`nginx`, `httpd` and `apache2` unit for a page, on its own port, and after
+`HEALTH_FAILS` runs without an answer it takes a snapshot, mails, and with
+`HEALTH_RESTART=1` restarts that unit.
+
+```sh
+load-monitor health                      # what it finds, changes nothing
+HEALTH_TEST_FAIL=httpd load-monitor      # fake an outage of httpd (use a test
+                                         # config with HEALTH_RESTART=0 and its
+                                         # own LOG, SNAPSHOT_DIR, HEALTH_STATE_DIR)
+```
+
+The rules, all of them from something that would otherwise have gone wrong:
+
+- **Down means curl exit 7 or 28**, refused or timed out. Every HTTP status is
+  an answer, and so is an empty reply: Forge's catch-all vhost does
+  `return 444`, which curl reports as `000` with exit 52. A check on `000`
+  would restart nginx on every Forge box every ten minutes.
+- **Each web server on its own port.** The socket comes from `ss -Hltnp` by
+  process name: port 80, else 8080, else the lowest. Behind `nginx_apache`
+  that is nginx on 80 and Apache on 8080. Asking through nginx is not enough:
+  a hung Apache behind it still gets a 504 out of nginx, and that is an answer.
+- **Loopback of the same family.** `0.0.0.0` and `*` become `127.0.0.1`, `[::]`
+  becomes `[::1]` (with `bindv6only` it takes no IPv4), a specific address
+  stays itself.
+- **`curl -g`.** curl 7.29 on CentOS 7 reads `http://[::1]/` as a malformed
+  URL (exit 3) without it, and the check would never fire.
+- **No socket found is not an outage.** Without root `ss -p` shows no process
+  names at all; the unit is then reported as not checked, not restarted.
+- **Stopped on purpose is left alone.** Only `active` units are checked.
+  `failed` counts as down, but only while the unit is enabled, so a leftover
+  unit from an earlier setup does not.
+- **No restart while something installs.** yum, dnf, rpm, apt, dpkg,
+  unattended-upgrade or a CustomBuild `build` stop and start the web server
+  themselves.
+- **At most one restart per unit per `HEALTH_RESTART_MIN_INTERVAL`**, 600 s by
+  default, so a server that cannot start does not loop.
+- **Mail on change only:** down (with a snapshot taken before the restart, so
+  it shows the hang), every `HEALTH_REMIND_RUNS` runs while still down, and
+  once when it answers again.
 
 ## What a snapshot contains
 

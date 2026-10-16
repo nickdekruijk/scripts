@@ -79,6 +79,26 @@ ACCESS_LOG_TAIL=20000
 # DirectAdmin: /usr/local/php*/var/log/php-fpm.log. Forge: /var/log/php*-fpm.log.
 FPM_LOGS=""
 
+# ---------------------------------------------------------------------------
+# Web server health check (off by default)
+#
+# Asks every running nginx, httpd or apache2 unit for a page on its own port,
+# every run. Two runs in a row with no answer (curl exit 7 or 28) is an outage:
+# a snapshot, a mail, and with HEALTH_RESTART=1 a restart of that one unit, at
+# most once per HEALTH_RESTART_MIN_INTERVAL seconds and never while yum, apt or
+# CustomBuild runs. Mail again every HEALTH_REMIND_RUNS runs while still down,
+# and once when it answers again. "load-monitor health" shows what it finds.
+#
+# On nginx-only boxes this only sees nginx itself: a full php-fpm pool still
+# gets a 502 or 504 out of nginx, and that counts as an answer.
+# ---------------------------------------------------------------------------
+#HEALTH_CHECK=1
+#HEALTH_RESTART=1
+#HEALTH_TIMEOUT=10
+#HEALTH_FAILS=2
+#HEALTH_RESTART_MIN_INTERVAL=600
+#HEALTH_REMIND_RUNS=60
+
 # Which unix sockets count as php-fpm in block 7. The default matches both
 # spellings in use: /run/php/php8.3-fpm-site.sock on Forge and Debian, and
 # /usr/local/php81/sockets/site.sock on DirectAdmin, which has no "fpm" in the

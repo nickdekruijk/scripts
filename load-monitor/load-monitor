@@ -28,6 +28,26 @@
 # average it regularly fired a second time when the real problem was already
 # over. The second peak in those mails was the restart itself.
 #
+# The one exception is opt-in and has nothing to do with load: with
+# HEALTH_CHECK=1 every run asks each running web server (nginx, httpd, apache2)
+# for a page on its own port, and with HEALTH_RESTART=1 it restarts the one that
+# stops answering. Apache on a DirectAdmin box once sat for four and a
+# half hours with every scoreboard slot taken by hung HTTP/2 streams, at a load
+# of 0.05: nothing load-based could see it. Rules, each learned the hard way:
+#   - only curl exit 7 (refused) and 28 (timeout) count as down. Any HTTP
+#     status is an answer, and so is an empty reply (exit 52): Forge's catch-all
+#     vhost does "return 444", which curl reports as 000
+#   - every web server is asked directly on its own port. Behind nginx_apache a
+#     hung Apache still gets a 504 out of nginx, and a 504 is an answer
+#   - curl -g, or an IPv6 literal like [::1] is a malformed URL to curl 7.29
+#     (exit 3) and the check silently never fires
+#   - a unit that was stopped on purpose is left alone; failed counts, but only
+#     while the unit is enabled, so a leftover from an old setup does not
+#   - HEALTH_FAILS runs in a row before acting, at most one restart per unit per
+#     HEALTH_RESTART_MIN_INTERVAL, none while yum, apt or CustomBuild runs
+#   - mail only on a change: down (with a snapshot), hourly while still down,
+#     and back up. Never one per minute
+#
 # Configuration lives in CONF (default /etc/load-monitor.conf), see
 # load-monitor.conf.example. Everything server specific goes there, so this
 # file is the same on every machine. It runs on two kinds of box:
@@ -44,7 +64,12 @@
 # Usage:
 #   load-monitor            normal run (this is what cron calls, every minute)
 #   load-monitor debug      force a snapshot at any load, useful for testing
+#   load-monitor health     show which web servers the health check finds and
+#                           whether they answer; changes nothing, acts on nothing
 #   load-monitor --help
+#
+# HEALTH_TEST_FAIL=<unit> in the environment makes the probe of that unit fail
+# as a timeout would, to test the alert path. Combine with HEALTH_RESTART=0.
 #
 # Requires bash, flock, ss, vmstat and top. curl for Apache's server-status,
 # mysql for the processlist. Linux only (GNU date, /proc).
@@ -87,6 +112,14 @@ FPM_LOGS=""
 # spellings seen in the wild: /run/php/php8.3-fpm-site.sock on Debian and Forge,
 # /usr/local/php81/sockets/site.sock on DirectAdmin.
 FPM_SOCKET_RE="fpm|/sockets/"
+# Web server health check, off unless set to 1. See the header for the rules.
+HEALTH_CHECK=0
+HEALTH_RESTART=0
+HEALTH_TIMEOUT=10
+HEALTH_FAILS=2
+HEALTH_RESTART_MIN_INTERVAL=600
+HEALTH_REMIND_RUNS=60
+HEALTH_STATE_DIR=/run/load-monitor.health
 
 case "${1:-}" in
     # print the header comment, however long it is, without tracking line numbers
@@ -96,6 +129,147 @@ DEBUG=0; [ "${1:-}" = "debug" ] && DEBUG=1
 
 # shellcheck disable=SC1090
 [ -r "$CONF" ] && . "$CONF"
+
+# ---- web server health ------------------------------------------------------
+HEALTH_REPORT=""     # opens the snapshot when a web server just went down
+HEALTH_STATUS=""     # one line per web server, a block in every snapshot
+HEALTH_SNAPSHOT=0
+HEALTH_RESTARTS=""   # units to restart once the snapshot is on disk
+
+# The socket to ask, as "host port". The unit's own process name, port 80 if it
+# has it, else 8080, else its lowest: behind nginx_apache that is Apache's 8080.
+# A wildcard address becomes loopback of the same family, because [::] does not
+# take IPv4 when bindv6only is set; a specific address stays what it is.
+health_target() {
+    ss -Hltnp 2>/dev/null | awk -v p="((\"$1\"," 'index($0, p) {print $4}' | awk '
+        { i = match($0, /:[0-9]+$/); port = substr($0, i + 1); addr = substr($0, 1, i - 1)
+          if (!(port in a)) ports[++n] = port
+          a[port] = a[port] " " addr }
+        END {
+            if (n == 0) exit
+            if ("80" in a) best = "80"; else if ("8080" in a) best = "8080"
+            else { best = ports[1]; for (k = 2; k <= n; k++) if (ports[k] + 0 < best + 0) best = ports[k] }
+            s = a[best] " "
+            if (s ~ / (0\.0\.0\.0|\*|127\.0\.0\.1) /) host = "127.0.0.1"
+            else if (s ~ / \[::1?\] /) host = "[::1]"
+            else { split(s, f, " "); host = f[1] }
+            print host, best
+        }'
+}
+
+# Prints "curl-exit http-code". Only 7 and 28 mean the server is not answering.
+health_probe() {
+    local code rc
+    if [ "${HEALTH_TEST_FAIL:-}" = "$1" ]; then echo "28 000"; return; fi
+    code=$(curl -g -s -o /dev/null -m "$HEALTH_TIMEOUT" -w '%{http_code}' "$2" 2>/dev/null); rc=$?
+    echo "$rc ${code:-000}"
+}
+
+# $1 = 1: only print what was found, touch no state, act on nothing.
+health_check() {
+    local dry=$1 unit state target host port url rc code down why f count last now found=0
+    now=$(date +%s)
+    [ "$dry" = 1 ] || { mkdir -p "$HEALTH_STATE_DIR" && chmod 700 "$HEALTH_STATE_DIR"; }
+    for unit in nginx httpd apache2; do
+        state=$(systemctl is-active "$unit" 2>/dev/null)
+        if [ "$state" = failed ]; then
+            [ "$(systemctl is-enabled "$unit" 2>/dev/null)" = enabled ] || continue
+        elif [ "$state" != active ]; then
+            continue
+        fi
+        found=1; down=0; why=""; url="-"; rc="-"; code="-"
+        f="$HEALTH_STATE_DIR/$unit"
+        if [ "$state" = failed ]; then
+            down=1; why="$unit is in state failed"
+        else
+            target=$(health_target "$unit")
+            if [ -z "$target" ]; then
+                # Not proof of a hang: without root, ss -p shows no process names
+                # at all. Guessing here would mean restarting a healthy server.
+                HEALTH_STATUS+="   $unit: active, but no listening socket found for it, not checked"
+                [ "$(id -u)" = 0 ] || HEALTH_STATUS+=" (not root, so ss -p shows no process names)"
+                HEALTH_STATUS+=$'\n'
+                continue
+            else
+                read -r host port <<< "$target"
+                url="http://$host:$port/"
+                read -r rc code <<< "$(health_probe "$unit" "$url")"
+                if [ "$rc" = 7 ] || [ "$rc" = 28 ]; then
+                    down=1; why="$unit on $host:$port gives no answer within ${HEALTH_TIMEOUT}s (curl exit $rc)"
+                fi
+            fi
+        fi
+        HEALTH_STATUS+="$(printf '   %-8s %-26s curl exit %-3s HTTP %-4s %s' "$unit" "$url" "$rc" "$code" \
+            "$([ "$down" = 1 ] && echo DOWN || echo ok)")"$'\n'
+        [ "$dry" = 1 ] && continue
+
+        count=$(cat "$f.count" 2>/dev/null || echo 0)
+        if [ "$down" = 0 ]; then
+            [ "$count" -ge "$HEALTH_FAILS" ] && \
+                echo "$(date '+%d-%m %H:%M:%S') $unit answers again, after $count runs without an answer."
+            echo 0 > "$f.count"
+            continue
+        fi
+        count=$((count + 1)); echo "$count" > "$f.count"
+        [ "$count" -lt "$HEALTH_FAILS" ] && continue
+        if [ "$count" -eq "$HEALTH_FAILS" ]; then
+            HEALTH_SNAPSHOT=1
+            HEALTH_REPORT+="$(date '+%d-%m %H:%M:%S') WEB SERVER DOWN: $why, $count runs in a row."$'\n'
+        elif [ $(( (count - HEALTH_FAILS) % HEALTH_REMIND_RUNS )) -eq 0 ]; then
+            echo "$(date '+%d-%m %H:%M:%S') Still down after $count runs: $why."
+        fi
+        [ "$HEALTH_RESTART" = 1 ] || continue
+        last=$(cat "$f.restarted" 2>/dev/null || echo 0)
+        if [ $((now - last)) -ge "$HEALTH_RESTART_MIN_INTERVAL" ]; then
+            HEALTH_RESTARTS+=" $unit"
+        elif [ "$count" -eq "$HEALTH_FAILS" ]; then
+            HEALTH_REPORT+="Not restarting $unit: it was restarted $((now - last))s ago (HEALTH_RESTART_MIN_INTERVAL $HEALTH_RESTART_MIN_INTERVAL)."$'\n'
+        fi
+    done
+    if [ "$dry" = 1 ] && [ "$found" = 0 ]; then
+        HEALTH_STATUS="   no running nginx, httpd or apache2 unit found"$'\n'
+    fi
+}
+
+# Restart one unit, unless something is installing or rebuilding: yum, apt and
+# CustomBuild stop and start the web server themselves.
+health_restart() {
+    local unit=$1 p busy="" rc host port code
+    for p in yum dnf rpm apt apt-get dpkg build; do
+        pgrep -x "$p" >/dev/null 2>&1 && { busy=$p; break; }
+    done
+    [ -z "$busy" ] && pgrep -f 'bin/unattended-upgrade( |$)' >/dev/null 2>&1 && busy=unattended-upgrade
+    if [ -n "$busy" ]; then
+        echo "$(date '+%d-%m %H:%M:%S') Not restarting $unit now: $busy is running. Trying again next run."
+        return
+    fi
+    echo "$(date '+%d-%m %H:%M:%S') Restarting $unit"
+    timeout 180 systemctl restart "$unit" 2>&1; rc=$?
+    date +%s > "$HEALTH_STATE_DIR/$unit.restarted"
+    sleep 3
+    code="no socket"
+    read -r host port <<< "$(health_target "$unit")"
+    # The real answer, also when HEALTH_TEST_FAIL faked the outage
+    [ -n "${port:-}" ] && code="curl exit $(HEALTH_TEST_FAIL="" health_probe "$unit" "http://$host:$port/" | sed 's/ / HTTP /')"
+    echo "$(date '+%d-%m %H:%M:%S') systemctl restart $unit exited $rc, now: $code"
+}
+
+# $1 = snapshot file to append the result to, or empty.
+health_restarts() {
+    local unit msg
+    for unit in $HEALTH_RESTARTS; do
+        msg=$(health_restart "$unit")
+        [ -n "$1" ] && printf '%s\n' "$msg" >> "$1"
+        printf '%s\n' "$msg"
+    done
+}
+
+if [ "${1:-}" = "health" ]; then
+    health_check 1
+    echo "HEALTH_CHECK=$HEALTH_CHECK HEALTH_RESTART=$HEALTH_RESTART in $CONF"
+    printf '%s' "$HEALTH_STATUS"
+    exit 0
+fi
 
 # ---- one instance at a time -------------------------------------------------
 # A snapshot takes a few seconds; cron fires every minute. If the previous run
@@ -113,13 +287,30 @@ echo 0 > "$LOCK_COUNT"
 read -r L1 L5 L15 _ < /proc/loadavg
 printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "$L1" "$L5" "$L15" >> "$LOG"
 
+[ "$HEALTH_CHECK" = 1 ] && health_check 0
+
 high=$(awk -v l="$L1" -v t="$THRESHOLD" 'BEGIN{print (l+0 >= t+0) ? 1 : 0}')
-[ "$high" = 1 ] || [ "$DEBUG" = 1 ] || exit 0
+if [ "$high" != 1 ] && [ "$DEBUG" != 1 ] && [ "$HEALTH_SNAPSHOT" != 1 ]; then
+    health_restarts ""
+    exit 0
+fi
 
 # ---- snapshot ---------------------------------------------------------------
 snapshot() {
-    echo "$(date '+%d-%m %H:%M:%S') The server is heavily loaded: $L1, $L5, $L15"
+    if [ -n "$HEALTH_REPORT" ]; then
+        printf '%s\n' "$HEALTH_REPORT"
+    fi
+    if [ "$high" = 1 ] || [ -z "$HEALTH_REPORT" ]; then
+        echo "$(date '+%d-%m %H:%M:%S') The server is heavily loaded: $L1, $L5, $L15"
+    else
+        echo "$(date '+%d-%m %H:%M:%S') Load: $L1, $L5, $L15"
+    fi
     echo
+    if [ -n "$HEALTH_STATUS" ]; then
+        echo "WEB SERVER HEALTH (each asked on its own port)"; echo "================================"
+        printf '%s' "$HEALTH_STATUS"
+        echo
+    fi
 
     echo "TOP 10"; echo "================================"
     top -bn1 2>/dev/null | head -17
@@ -322,5 +513,7 @@ umask 077
 snapshot > "$out" 2>&1
 chmod 600 "$out" 2>/dev/null
 cat "$out"
+# Restart only now, so the snapshot shows the server as it hung.
+health_restarts "$out"
 find "$SNAPSHOT_DIR" -maxdepth 1 -name '*.txt' -mtime +"$RETENTION_DAYS" -delete 2>/dev/null
 exit 0
