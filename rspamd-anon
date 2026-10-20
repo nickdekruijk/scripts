@@ -88,10 +88,17 @@ sub mask_ip {
     return "ip-$h";
 }
 
-# Eigen domeinen inlezen
-my %own;
+# Eigen domeinen inlezen. Sommige verzendplatforms halen in een VERP-adres de
+# punt uit het domein (jan=klantnl), dus die vorm onthouden we ook.
+my (%own, %own_nodot);
 open(my $df, "<", $domain_file) or die "domains: $!";
-while (<$df>) { chomp; s/^\s+|\s+$//g; $own{lc $_} = 1 if length; }
+while (<$df>) {
+    chomp; s/^\s+|\s+$//g;
+    next unless length;
+    $own{lc $_} = 1;
+    (my $n = lc $_) =~ s/\.//g;
+    $own_nodot{$n} = 1;
+}
 close $df;
 
 # Is het domein (of een bovenliggend domein) van ons?
@@ -99,7 +106,7 @@ sub is_own {
     my $probe = lc shift;
     while ($probe =~ /\./) {
         return 1 if $own{$probe};
-        $probe =~ s/^[^.]+\.//;
+        $probe =~ s/^[^.]*\.//;
     }
     return 0;
 }
@@ -120,8 +127,9 @@ sub anon {
 # bounces+123-jan=klant.nl@esp.example of SRS0=ab=cd=klant.nl=jan@forwarder.example
 sub hides_own {
     my $local = shift;
-    while ($local =~ /=([a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)+)/g) {
-        return 1 if is_own($1);
+    while ($local =~ /=([a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*)/g) {
+        my $d = $1;
+        return 1 if ($d =~ /\./ && is_own($d)) || $own_nodot{lc $d};
     }
     return 0;
 }
@@ -183,6 +191,14 @@ while (my $line = <STDIN>) {
         : $tok =~ /^([^@]+)\@([^@]+)$/ && !is_own($2) ? $pre . "fwd-" . substr(md5_hex($salt . lc $tok), 0, 10) . "\@$2" . $post
         :                                              "$pre$tok$post";
     }ge;
+
+    # rspamd zet soms alleen het local part in de opties, zonder @ erachter:
+    # TAGGED_FROM(0.00){123-jan=klant.nl;}. Bevat zo een los stuk via VERP of
+    # SRS een adres op ons domein, dan gaat het hele stuk weg.
+    $line =~ s{(?<=[{;])([^;{}\s\@=]*=[^;{}\s\@]*)(?=[;}])}{
+        my $t = $1;
+        hides_own($t) ? "verp-" . substr(md5_hex($salt . lc $t), 0, 10) : $t;
+    }ge if $line =~ /\{[^}]*=/;
 
     # Adres maskeren als het domein van ons is, of als het local part via
     # VERP of SRS een adres op ons domein bevat
