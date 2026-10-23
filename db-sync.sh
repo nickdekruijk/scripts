@@ -47,7 +47,9 @@ usage() {
     echo "  --db-host=HOST        Remote DB host as seen from the server (overrides remote .env)"
     echo "  --db-port=PORT        Remote DB port (overrides remote .env)"
     echo "  --project=PATH        Local project root holding .env (default: current directory)"
-    echo "  --remote-env=PATH     Path to .env on the server (default: ~/HOST/.env)"
+    echo "  --remote-env=PATH     Path to .env on the server, or to the site directory; relative"
+    echo "                        to the home directory (default: ~/HOST/.env, else the only"
+    echo "                        ~/*/.env with database settings)"
     echo "  --ssh-port=PORT       SSH port (default: 22)"
     echo "  --ssh-key=PATH        Path to SSH private key (default: SSH agent)"
     echo "  --add-drop-database   Dump with --add-drop-database --databases, so the target"
@@ -142,31 +144,97 @@ remote_env_value() {
               -e 's/^"//' -e 's/"$//' || true
 }
 
+# Every file the lookup prints is preceded by a marker line with its path, so the
+# output can hold several .env files and the run shows which one it used.
+ENV_MARKER="# db-sync-env: "
+
+# A relative path is taken from the home directory, and a path to the site directory
+# gets its .env added, so --remote-env=example.test is enough. The ~ is left for the
+# remote shell to expand.
+if [[ -n "$REMOTE_ENV_PATH" ]]; then
+    [[ "$REMOTE_ENV_PATH" == /* || "$REMOTE_ENV_PATH" == "~"* ]] || REMOTE_ENV_PATH="~/$REMOTE_ENV_PATH"
+    [[ "$REMOTE_ENV_PATH" == */.env ]] || REMOTE_ENV_PATH="${REMOTE_ENV_PATH%/}/.env"
+fi
+
 if [[ -n "$REMOTE_ENV_PATH" ]]; then
     echo "  Reading remote .env from $PROD_SSH_USER@$PROD_SSH_HOST:$REMOTE_ENV_PATH..."
-    REMOTE_ENV_LOOKUP="cat $REMOTE_ENV_PATH"
+    REMOTE_ENV_LOOKUP="f=$REMOTE_ENV_PATH; if [ -f \"\$f\" ]; then echo \"$ENV_MARKER\$f\"; cat \"\$f\"; echo; fi"
 else
     # The Forge convention is ~/SITE/.env, but SITE is the site's directory name,
     # which only matches the SSH host when you connect by domain. Connecting by IP
-    # (or to a *.on-forge.com site) needs the single ~/*/.env in the home directory.
+    # (or to a *.on-forge.com site) needs the ~/*/.env files in the home directory,
+    # and one user can hold several sites, so all of them are fetched and picked below.
     echo "  Looking for the remote .env on $PROD_SSH_USER@$PROD_SSH_HOST..."
-    REMOTE_ENV_LOOKUP="for f in ~/$PROD_SSH_HOST/.env ~/*/.env; do
-        if [ -f \"\$f\" ]; then echo \"# db-sync-env: \$f\"; cat \"\$f\"; exit 0; fi
+    REMOTE_ENV_LOOKUP="for f in ~/*/.env; do
+        if [ -f \"\$f\" ]; then echo \"$ENV_MARKER\$f\"; cat \"\$f\"; echo; fi
     done"
 fi
 
 # -n keeps ssh from swallowing stdin, which the confirmation prompt still needs.
-REMOTE_ENV_CONTENT="$(ssh -n "${SSH_OPTS[@]}" "$PROD_SSH_USER@$PROD_SSH_HOST" "$REMOTE_ENV_LOOKUP" 2>/dev/null || true)"
+# Exit status 255 is ssh itself failing, as opposed to the remote command.
+SSH_STATUS=0
+REMOTE_ENV_OUTPUT="$(ssh -n "${SSH_OPTS[@]}" "$PROD_SSH_USER@$PROD_SSH_HOST" "$REMOTE_ENV_LOOKUP" 2>/dev/null)" || SSH_STATUS=$?
+if [[ "$SSH_STATUS" == "255" ]]; then
+    echo "Error: Could not connect to $PROD_SSH_USER@$PROD_SSH_HOST over SSH."
+    exit 1
+fi
 
-# The lookup marks which file it found, so the run is auditable.
-REMOTE_ENV_FOUND="$(echo "$REMOTE_ENV_CONTENT" | grep -E '^# db-sync-env: ' | head -1 | cut -d' ' -f3- || true)"
-if [[ -n "$REMOTE_ENV_FOUND" ]]; then
-    REMOTE_ENV_PATH="$REMOTE_ENV_FOUND"
+# The contents of one file from the lookup output, by its path.
+remote_env_file() {
+    local path="$1"
+    echo "$REMOTE_ENV_OUTPUT" | awk -v marker="$ENV_MARKER$path" -v prefix="$ENV_MARKER" '
+        index($0, prefix) == 1 { inside = ($0 == marker); next }
+        inside { print }'
+}
+
+REMOTE_ENV_PATHS=()
+while IFS= read -r line; do
+    REMOTE_ENV_PATHS+=("${line#"$ENV_MARKER"}")
+done < <(echo "$REMOTE_ENV_OUTPUT" | grep -F "$ENV_MARKER" || true)
+
+if [[ -n "$REMOTE_ENV_PATH" ]]; then
+    if [[ ${#REMOTE_ENV_PATHS[@]} -eq 0 ]]; then
+        echo "Error: $REMOTE_ENV_PATH not found on $PROD_SSH_HOST."
+        exit 1
+    fi
+    REMOTE_ENV_PATH="${REMOTE_ENV_PATHS[0]}"
+else
+    # Pick the site directory named after the SSH host. Otherwise only the files that
+    # configure a database count, narrowed to the requested database name if one was
+    # given. A site without a database (a static site, or one on SQLite) is skipped.
+    CANDIDATES=()
+    for path in ${REMOTE_ENV_PATHS[@]+"${REMOTE_ENV_PATHS[@]}"}; do
+        if [[ "$path" == */"$PROD_SSH_HOST"/.env ]]; then
+            CANDIDATES=("$path")
+            break
+        fi
+        content="$(remote_env_file "$path")"
+        name="$(remote_env_value DB_DATABASE "$content")"
+        [[ -z "$name" ]] && continue
+        [[ -n "$PROD_DB_DATABASE" && "$name" != "$PROD_DB_DATABASE" ]] && continue
+        CANDIDATES+=("$path")
+    done
+
+    if [[ ${#CANDIDATES[@]} -gt 1 ]]; then
+        echo "Error: Several sites on $PROD_SSH_HOST configure a database:"
+        printf '         %s\n' "${CANDIDATES[@]}"
+        echo "       Pick one with --remote-env=PATH, or name the database as the second argument."
+        exit 1
+    fi
+    REMOTE_ENV_PATH="${CANDIDATES[0]-}"
+fi
+
+REMOTE_ENV_CONTENT=""
+if [[ -n "$REMOTE_ENV_PATH" ]]; then
+    REMOTE_ENV_CONTENT="$(remote_env_file "$REMOTE_ENV_PATH")"
     echo "  Found $REMOTE_ENV_PATH"
+    if [[ -z "$(remote_env_value DB_DATABASE "$REMOTE_ENV_CONTENT")" ]]; then
+        echo "  Warning: $REMOTE_ENV_PATH has no DB_DATABASE, so the defaults below are guesses."
+    fi
 fi
 
 if [[ -z "$REMOTE_ENV_CONTENT" ]]; then
-    echo "  Warning: Could not read a remote .env. Falling back to flag values."
+    echo "  Warning: No remote .env with database settings${PROD_DB_DATABASE:+ for '$PROD_DB_DATABASE'} found. Falling back to flag values."
 else
     # Use remote .env values as defaults (flags take precedence)
     [[ -z "$PROD_DB_DATABASE" ]] && PROD_DB_DATABASE="$(remote_env_value DB_DATABASE "$REMOTE_ENV_CONTENT")"
@@ -198,7 +266,7 @@ env_value() {
         | cut -d'=' -f2- \
         | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
               -e "s/^'//" -e "s/'$//" \
-              -e 's/^"//' -e 's/"$//'
+              -e 's/^"//' -e 's/"$//' || true
 }
 
 LOCAL_DB_HOST="$(env_value DB_HOST)"; LOCAL_DB_HOST="${LOCAL_DB_HOST:-127.0.0.1}"
@@ -211,6 +279,51 @@ if [[ -z "$LOCAL_DB_DATABASE" || -z "$LOCAL_DB_USERNAME" ]]; then
     echo "Error: Missing DB_DATABASE or DB_USERNAME in $LOCAL_ENV."
     exit 1
 fi
+
+LOCAL_MYSQL_OPTS=(--host="$LOCAL_DB_HOST" --port="$LOCAL_DB_PORT" --user="$LOCAL_DB_USERNAME")
+
+# Without --add-drop-database the dump has no CREATE DATABASE, and mysql refuses to
+# import into a database that does not exist yet, as on a fresh checkout. Check it
+# here, so a missing database or a broken local connection stops the run before
+# anything goes over SSH. SHOW DATABASES LIKE would treat _ in the name as a wildcard.
+CREATE_LOCAL_DATABASE=""
+if [[ "$DIRECTION" == "pull" && -z "$ADD_DROP_DATABASE" ]]; then
+    LOCAL_DB_EXISTS="$(MYSQL_PWD="$LOCAL_DB_PASSWORD" mysql "${LOCAL_MYSQL_OPTS[@]}" -N -B -e \
+        "SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = '${LOCAL_DB_DATABASE//\'/\'\'}'")" || {
+        echo "Error: Could not connect to the local database server at $LOCAL_DB_HOST:$LOCAL_DB_PORT."
+        exit 1
+    }
+    if [[ "$LOCAL_DB_EXISTS" == "0" ]]; then
+        CREATE_LOCAL_DATABASE="1"
+    fi
+fi
+
+# ── Check the live database ──────────────────────────────────────────────────
+
+# The remote command is a single string re-parsed by the remote shell, so every
+# value interpolated into it has to be quoted for that shell.
+REMOTE_CONN="--host=$(printf '%q' "$PROD_DB_HOST") \
+    --port=$(printf '%q' "$PROD_DB_PORT") \
+    --user=$(printf '%q' "$PROD_DB_USERNAME")"
+
+REMOTE_PWD_PREFIX=""
+if [[ -n "$PROD_DB_PASSWORD" ]]; then
+    REMOTE_PWD_PREFIX="MYSQL_PWD=$(printf '%q' "$PROD_DB_PASSWORD") "
+fi
+
+# Wrong or missing live credentials would otherwise only show once the sync runs.
+# Only a push with --add-drop-database may target a live database that is not there.
+REMOTE_CHECK_TARGET=" $(printf '%q' "$PROD_DB_DATABASE")"
+if [[ "$DIRECTION" == "push" && -n "$ADD_DROP_DATABASE" ]]; then
+    REMOTE_CHECK_TARGET=""
+fi
+
+REMOTE_CHECK_ERROR="$(ssh -n "${SSH_OPTS[@]}" "$PROD_SSH_USER@$PROD_SSH_HOST" \
+    "${REMOTE_PWD_PREFIX}mysql $REMOTE_CONN -N -B -e 'SELECT 1'$REMOTE_CHECK_TARGET 2>&1 >/dev/null")" || {
+    echo "Error: Could not open live database '$PROD_DB_DATABASE' as '$PROD_DB_USERNAME' on $PROD_SSH_HOST:"
+    echo "       $REMOTE_CHECK_ERROR"
+    exit 1
+}
 
 # ── Confirmation prompt ──────────────────────────────────────────────────────
 
@@ -241,7 +354,13 @@ else
     echo "  Live database : $PROD_DB_DATABASE @ $PROD_SSH_HOST (via SSH)"
     echo "  Local database: $LOCAL_DB_DATABASE @ $LOCAL_DB_HOST:$LOCAL_DB_PORT"
     echo ""
-    echo "  WARNING: This will OVERWRITE your local database."
+    if [[ -n "$CREATE_LOCAL_DATABASE" ]]; then
+        # Asked rather than assumed: a typo in DB_DATABASE would otherwise quietly
+        # leave a stray database behind.
+        echo "  Local database '$LOCAL_DB_DATABASE' does not exist. It will be created and filled."
+    else
+        echo "  WARNING: This will OVERWRITE your local database."
+    fi
     if [[ -n "$ADD_DROP_DATABASE" ]]; then
         echo "  WARNING: Local database '$LOCAL_DB_DATABASE' is DROPPED and recreated first."
     fi
@@ -301,17 +420,6 @@ if [[ -n "$ADD_DROP_DATABASE" && "$PROD_DB_DATABASE" != "$LOCAL_DB_DATABASE" ]];
     done
 fi
 
-# The remote command is a single string re-parsed by the remote shell, so every
-# value interpolated into it has to be quoted for that shell.
-REMOTE_CONN="--host=$(printf '%q' "$PROD_DB_HOST") \
-    --port=$(printf '%q' "$PROD_DB_PORT") \
-    --user=$(printf '%q' "$PROD_DB_USERNAME")"
-
-REMOTE_PWD_PREFIX=""
-if [[ -n "$PROD_DB_PASSWORD" ]]; then
-    REMOTE_PWD_PREFIX="MYSQL_PWD=$(printf '%q' "$PROD_DB_PASSWORD") "
-fi
-
 REMOTE_DUMP_CMD="${REMOTE_PWD_PREFIX}mysqldump $REMOTE_CONN \
     --single-transaction \
     --no-tablespaces \
@@ -328,7 +436,6 @@ fi
 
 REMOTE_IMPORT_CMD="${REMOTE_PWD_PREFIX}mysql $REMOTE_CONN$REMOTE_IMPORT_TARGET"
 
-LOCAL_MYSQL_OPTS=(--host="$LOCAL_DB_HOST" --port="$LOCAL_DB_PORT" --user="$LOCAL_DB_USERNAME")
 LOCAL_DUMP_OPTS=("${LOCAL_MYSQL_OPTS[@]}" --single-transaction --no-tablespaces --skip-lock-tables $DUMP_DATABASE_OPTS)
 
 LOCAL_IMPORT_OPTS=("${LOCAL_MYSQL_OPTS[@]}")
@@ -342,19 +449,34 @@ if [[ "$DIRECTION" == "push" ]]; then
     echo "  Dumping local database and importing it on the live server..."
     echo ""
 
-    MYSQL_PWD="$LOCAL_DB_PASSWORD" mysqldump "${LOCAL_DUMP_OPTS[@]}" "$LOCAL_DB_DATABASE" \
+    # Without the check, set -e would stop on a failed pipe without saying so.
+    if ! MYSQL_PWD="$LOCAL_DB_PASSWORD" mysqldump "${LOCAL_DUMP_OPTS[@]}" "$LOCAL_DB_DATABASE" \
         | rewrite_database_name "$LOCAL_DB_DATABASE" "$PROD_DB_DATABASE" \
-        | ssh "${SSH_OPTS[@]}" "$PROD_SSH_USER@$PROD_SSH_HOST" "$REMOTE_IMPORT_CMD"
+        | ssh "${SSH_OPTS[@]}" "$PROD_SSH_USER@$PROD_SSH_HOST" "$REMOTE_IMPORT_CMD"; then
+        echo ""
+        echo "Error: The sync failed. Live database '$PROD_DB_DATABASE' may be partly updated."
+        exit 1
+    fi
 
     echo "  Done! Live database '$PROD_DB_DATABASE' has been updated."
     echo ""
 else
+    if [[ -n "$CREATE_LOCAL_DATABASE" ]]; then
+        echo "  Creating local database '$LOCAL_DB_DATABASE'..."
+        MYSQL_PWD="$LOCAL_DB_PASSWORD" mysql "${LOCAL_MYSQL_OPTS[@]}" \
+            -e "CREATE DATABASE \`${LOCAL_DB_DATABASE//\`/\`\`}\`"
+    fi
+
     echo "  Dumping live database via SSH..."
     echo ""
 
-    ssh "${SSH_OPTS[@]}" "$PROD_SSH_USER@$PROD_SSH_HOST" "$REMOTE_DUMP_CMD" \
+    if ! ssh "${SSH_OPTS[@]}" "$PROD_SSH_USER@$PROD_SSH_HOST" "$REMOTE_DUMP_CMD" \
         | rewrite_database_name "$PROD_DB_DATABASE" "$LOCAL_DB_DATABASE" \
-        | MYSQL_PWD="$LOCAL_DB_PASSWORD" mysql "${LOCAL_IMPORT_OPTS[@]}"
+        | MYSQL_PWD="$LOCAL_DB_PASSWORD" mysql "${LOCAL_IMPORT_OPTS[@]}"; then
+        echo ""
+        echo "Error: The sync failed. Local database '$LOCAL_DB_DATABASE' may be partly updated."
+        exit 1
+    fi
 
     echo "  Done! Local database '$LOCAL_DB_DATABASE' has been updated."
     echo ""

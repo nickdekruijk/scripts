@@ -44,6 +44,15 @@ carries live data, so:
   host is added silently, a *changed* host key is a hard error.
 - `db-sync.sh --push` overwrites the live database. It asks you to type the live
   database name first, unless you pass `--force-push`.
+- `db-sync.sh` reads the remote credentials from `~/HOST/.env`, or else from the one
+  `~/*/.env` that configures a database. When one SSH user holds several sites with a
+  database it stops and asks you to pick one: name the database as the second argument,
+  or pass `--remote-env=example.test` (relative to the home directory, `/.env` optional).
+- Wrong live credentials or an unreachable local MySQL stop the run before anything
+  is overwritten, and a sync that fails halfway says so instead of exiting silently.
+- A pull into a local database that does not exist yet creates it, after the usual
+  confirmation (which `-y` skips). The prompt names the database, so a typo in the
+  local `DB_DATABASE` shows up before anything is created.
 - Prefer `db-clonio.sh` for anything you do not strictly need real data for.
 
 ## `CLAUDE.md`
