@@ -44,6 +44,10 @@ carries live data, so:
   host is added silently, a *changed* host key is a hard error.
 - `db-sync.sh --push` overwrites the live database. It asks you to type the live
   database name first, unless you pass `--force-push`.
+- `--skip-table=a,b,c` (a list, or repeat the option) leaves tables out of the sync, so the target keeps its
+  own rows: content can go up while orders, requests or a queue made on live stay. The
+  dump simply has no `DROP TABLE` for it. Not with `--add-drop-database`, which would drop
+  the kept tables along with the rest.
 - `db-sync.sh` reads the remote credentials from `~/HOST/.env`, or else from the one
   `~/*/.env` that configures a database. When one SSH user holds several sites with a
   database it stops and asks you to pick one: name the database as the second argument,

@@ -15,6 +15,7 @@
 #   bash scripts/db-sync.sh --ssh-host=example.test --ssh-user=forge
 #   bash scripts/db-sync.sh forge@example.test --push
 #   bash scripts/db-sync.sh forge@example.test --add-drop-database
+#   bash scripts/db-sync.sh forge@example.test --push --skip-table=orders,jobs
 #
 set -euo pipefail
 
@@ -54,6 +55,9 @@ usage() {
     echo "  --ssh-key=PATH        Path to SSH private key (default: SSH agent)"
     echo "  --add-drop-database   Dump with --add-drop-database --databases, so the target"
     echo "                        database is dropped and recreated before the import"
+    echo "  --skip-table=A,B      Leave these tables out of the sync, so the target keeps its own"
+    echo "                        rows (a comma-separated list, or repeat the option;"
+    echo "                        not with --add-drop-database)"
     echo "  -y, --yes             Skip the confirmation prompt (pull only)"
     echo "  --force-push          Skip the confirmation prompt when pushing to live"
     echo "  -h, --help            Show this help message"
@@ -76,6 +80,7 @@ ASSUME_YES=""
 FORCE_PUSH=""
 DIRECTION="pull"
 ADD_DROP_DATABASE=""
+SKIP_TABLES=()
 
 for arg in "$@"; do
     case "$arg" in
@@ -83,6 +88,11 @@ for arg in "$@"; do
         --pull|--from-live) DIRECTION="pull" ;;
         --force-push)       FORCE_PUSH="1" ;;
         --add-drop-database) ADD_DROP_DATABASE="1" ;;
+        --skip-table=*)
+            # A comma-separated list or one name; the option can also be repeated.
+            IFS=',' read -r -a skip_list <<< "${arg#*=}"
+            SKIP_TABLES+=(${skip_list[@]+"${skip_list[@]}"})
+            ;;
         --ssh-host=*)  PROD_SSH_HOST="${arg#*=}" ;;
         --ssh-user=*)  PROD_SSH_USER="${arg#*=}" ;;
         --ssh-port=*)  PROD_SSH_PORT="${arg#*=}" ;;
@@ -111,6 +121,21 @@ for arg in "$@"; do
             ;;
     esac
 done
+
+# A skipped table is kept on the target because the dump has no DROP TABLE for it. A
+# dropped and recreated database has no tables left to keep, so the two do not combine.
+for table in ${SKIP_TABLES[@]+"${SKIP_TABLES[@]}"}; do
+    if [[ ! "$table" =~ ^[A-Za-z0-9_]+$ ]]; then
+        echo "Error: --skip-table takes a plain table name, not '$table'."
+        exit 1
+    fi
+done
+
+if [[ ${#SKIP_TABLES[@]} -gt 0 && -n "$ADD_DROP_DATABASE" ]]; then
+    echo "Error: --skip-table cannot be combined with --add-drop-database: the target database"
+    echo "       would be dropped, skipped tables included."
+    exit 1
+fi
 
 if [[ -z "$PROD_SSH_HOST" || -z "$PROD_SSH_USER" ]]; then
     echo "Error: SSH host and SSH user are required."
@@ -337,6 +362,9 @@ if [[ "$DIRECTION" == "push" ]]; then
     if [[ -n "$ADD_DROP_DATABASE" ]]; then
         echo "  WARNING: Live database '$PROD_DB_DATABASE' is DROPPED and recreated first."
     fi
+    if [[ ${#SKIP_TABLES[@]} -gt 0 ]]; then
+        echo "  Kept as they are on live: ${SKIP_TABLES[*]}"
+    fi
     echo ""
 
     # -y is deliberately not honoured here: pushing to live needs its own opt-in.
@@ -363,6 +391,9 @@ else
     fi
     if [[ -n "$ADD_DROP_DATABASE" ]]; then
         echo "  WARNING: Local database '$LOCAL_DB_DATABASE' is DROPPED and recreated first."
+    fi
+    if [[ ${#SKIP_TABLES[@]} -gt 0 ]]; then
+        echo "  Kept as they are locally: ${SKIP_TABLES[*]}"
     fi
     echo ""
 
@@ -420,11 +451,19 @@ if [[ -n "$ADD_DROP_DATABASE" && "$PROD_DB_DATABASE" != "$LOCAL_DB_DATABASE" ]];
     done
 fi
 
+# Skipped tables are left out of whichever side is dumped.
+REMOTE_IGNORE_OPTS=""
+LOCAL_IGNORE_OPTS=()
+for table in ${SKIP_TABLES[@]+"${SKIP_TABLES[@]}"}; do
+    REMOTE_IGNORE_OPTS+=" --ignore-table=$(printf '%q' "$PROD_DB_DATABASE.$table")"
+    LOCAL_IGNORE_OPTS+=(--ignore-table="$LOCAL_DB_DATABASE.$table")
+done
+
 REMOTE_DUMP_CMD="${REMOTE_PWD_PREFIX}mysqldump $REMOTE_CONN \
     --single-transaction \
     --no-tablespaces \
     --skip-lock-tables \
-    $DUMP_DATABASE_OPTS \
+    $DUMP_DATABASE_OPTS$REMOTE_IGNORE_OPTS \
     $(printf '%q' "$PROD_DB_DATABASE")"
 
 # A dump that drops and recreates the database selects it itself, and naming it on the
@@ -436,7 +475,7 @@ fi
 
 REMOTE_IMPORT_CMD="${REMOTE_PWD_PREFIX}mysql $REMOTE_CONN$REMOTE_IMPORT_TARGET"
 
-LOCAL_DUMP_OPTS=("${LOCAL_MYSQL_OPTS[@]}" --single-transaction --no-tablespaces --skip-lock-tables $DUMP_DATABASE_OPTS)
+LOCAL_DUMP_OPTS=("${LOCAL_MYSQL_OPTS[@]}" --single-transaction --no-tablespaces --skip-lock-tables $DUMP_DATABASE_OPTS ${LOCAL_IGNORE_OPTS[@]+"${LOCAL_IGNORE_OPTS[@]}"})
 
 LOCAL_IMPORT_OPTS=("${LOCAL_MYSQL_OPTS[@]}")
 if [[ -z "$ADD_DROP_DATABASE" ]]; then
